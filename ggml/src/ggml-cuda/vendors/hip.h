@@ -212,9 +212,12 @@
 #define CDNA // For the entire family
 #endif // defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 
-#if defined(__GFX12__)
+#if defined(__gfx1250__)
+// gfx1250 uses RDNA wave layout but lacks the RDNA4 dot2 and WMMA instructions.
+#define GFX1250
+#elif defined(__GFX12__)
 #define RDNA4
-#endif // defined(__GFX12__)
+#endif // defined(__gfx1250__) || defined(__GFX12__)
 
 #if defined(__GFX11__)
 #define RDNA3
@@ -237,9 +240,9 @@
 #define RDNA1
 #endif // defined(__gfx1010__) || defined(__gfx1012__)
 
-#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+#if defined(GFX1250) || defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
 #define RDNA // For the entire family
-#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
+#endif // defined(GFX1250) || defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(RDNA1)
 
 #ifndef __has_builtin
     #define __has_builtin(x) 0

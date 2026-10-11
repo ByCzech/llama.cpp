@@ -82,6 +82,7 @@
 #define GGML_CUDA_CC_RDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x1100) // RX 7000, minimum for WMMA
 #define GGML_CUDA_CC_RDNA3_5    (GGML_CUDA_CC_OFFSET_AMD + 0x1150) // AI 370, AI Max 395 laptops.
 #define GGML_CUDA_CC_RDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x1200) // RX 9000
+#define GGML_CUDA_CC_GFX1250    (GGML_CUDA_CC_OFFSET_AMD + 0x1250)
 
 #define GGML_CUDA_CC_IS_AMD(cc)     (cc >= GGML_CUDA_CC_OFFSET_AMD)
 #define GGML_CUDA_CC_IS_RDNA(cc)    (cc >= GGML_CUDA_CC_RDNA1)
@@ -90,7 +91,8 @@
 #define GGML_CUDA_CC_IS_RDNA3_0(cc) (cc >= GGML_CUDA_CC_RDNA3 && cc < GGML_CUDA_CC_RDNA3_5)
 #define GGML_CUDA_CC_IS_RDNA3_5(cc) (cc >= GGML_CUDA_CC_RDNA3_5 && cc < GGML_CUDA_CC_RDNA4)
 #define GGML_CUDA_CC_IS_RDNA3(cc)   (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc))
-#define GGML_CUDA_CC_IS_RDNA4(cc)   (cc >= GGML_CUDA_CC_RDNA4)
+#define GGML_CUDA_CC_IS_GFX1250(cc) ((cc) == GGML_CUDA_CC_GFX1250)
+#define GGML_CUDA_CC_IS_RDNA4(cc)   (cc >= GGML_CUDA_CC_RDNA4 && !GGML_CUDA_CC_IS_GFX1250(cc))
 #define GGML_CUDA_CC_IS_GCN_APU(cc) ((cc) == GGML_CUDA_CC_GFX909 || (cc) == GGML_CUDA_CC_GFX90C)
 #define GGML_CUDA_CC_IS_GCN(cc)     ((cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_CDNA1) || GGML_CUDA_CC_IS_GCN_APU(cc))
 #define GGML_CUDA_CC_IS_CDNA(cc)    (!GGML_CUDA_CC_IS_GCN_APU(cc) && cc >= GGML_CUDA_CC_CDNA1 && cc < GGML_CUDA_CC_RDNA1)
@@ -325,7 +327,7 @@ static bool fast_fp16_hardware_available(const int cc) {
 // To be used for feature selection of external libraries, e.g. cuBLAS.
 static bool fp16_mma_hardware_available(const int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+        GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_GFX1250(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 }
 
@@ -712,7 +714,7 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
     c = __builtin_amdgcn_sdot4(a, b, c, false);
-#elif defined(RDNA3) || defined(RDNA4)
+#elif defined(RDNA3) || defined(RDNA4) || defined(GFX1250)
     c = __builtin_amdgcn_sudot4( true, a, true, b, c, false);
 #elif defined(RDNA1) || defined(__gfx900__)
     int tmp1;
@@ -765,7 +767,8 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
 #ifdef V_DOT2_F32_F16_AVAILABLE
     asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(acc) : "v"(v), "v"(u));
 #else
-#ifdef FAST_FP16_AVAILABLE
+// gfx1250 has no dot2 instruction; keep products and accumulation in FP32.
+#if defined(FAST_FP16_AVAILABLE) && !defined(GFX1250)
     const float2 tmp = __half22float2(v*u);
     acc += tmp.x + tmp.y;
 #else
@@ -773,7 +776,7 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
     const float2 tmpu = __half22float2(u);
     acc += tmpv.x * tmpu.x;
     acc += tmpv.y * tmpu.y;
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && !defined(GFX1250)
 #endif // V_DOT2_F32_F16_AVAILABLE
 }
 
