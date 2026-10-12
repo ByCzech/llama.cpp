@@ -591,6 +591,17 @@ static void ggml_check_sycl() try {
         fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
 #endif
 */
+        // Probe device availability before any capability queries. The device
+        // manager can throw when no device matches the active SYCL selector.
+        if (CHECK_TRY_ERROR(g_all_sycl_device_count =
+                            dpct::dev_mgr::instance().device_count()) != 0 ||
+            g_all_sycl_device_count == 0) {
+            initialized = true;
+            g_sycl_loaded = false;
+            return;
+        }
+        GGML_ASSERT(g_all_sycl_device_count <= GGML_SYCL_MAX_DEVICES);
+
         // Async USM allocation/free is also useful outside the graph path: it avoids the host waits in the reorder
         // staging path while preserving queue ordering semantics. Graph support still depends on the extension being
         // available, but it no longer needs to control the non-graph fast path.
@@ -605,14 +616,6 @@ static void ggml_check_sycl() try {
             }
         }
 #endif
-        if (CHECK_TRY_ERROR(g_all_sycl_device_count =
-                            dpct::dev_mgr::instance().device_count()) != 0) {
-            initialized = true;
-            g_sycl_loaded = false;
-            return;
-        }
-        GGML_ASSERT(g_all_sycl_device_count <= GGML_SYCL_MAX_DEVICES);
-
         initialized = true;
         g_sycl_loaded = true;
         ggml_backend_sycl_print_sycl_devices();
@@ -7535,8 +7538,11 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
             ggml_check_sycl();
             ggml_backend_sycl_reg_context * ctx = new ggml_backend_sycl_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            // Preserve an empty registry after a failed device probe instead
+            // of trying to construct the device manager again.
+            const int device_count = g_sycl_loaded ? ggml_sycl_info().device_count : 0;
 
-            for (int i = 0; i < ggml_sycl_info().device_count; i++) {
+            for (int i = 0; i < device_count; i++) {
                 ggml_backend_sycl_device_context * dev_ctx = new ggml_backend_sycl_device_context;
                 dev_ctx->device = i;
                 dev_ctx->name = GGML_SYCL_NAME + std::to_string(i);
