@@ -625,6 +625,13 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor 
     return pimpl->copy_experts(backend, w, dst, e, last);
 }
 
+void llama_moe_cache::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    for (const auto & device : pimpl->devices) {
+        llama_memory_visit_buffer(device.buf.get(), LLAMA_MEMORY_COMPONENT_MOE_CACHE, visitor);
+    }
+    llama_memory_visit_buffer(pimpl->buf_host.get(), LLAMA_MEMORY_COMPONENT_MOE_CACHE, visitor);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> res;
     for (const auto & d : pimpl->devices) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-memory-view.h"
 
 #include "ggml-cpp.h"
 
@@ -15,6 +16,12 @@
 //
 
 struct llama_adapter_cvec {
+    void visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+        for (const auto & buffer : bufs) {
+            llama_memory_visit_buffer(buffer.get(), LLAMA_MEMORY_COMPONENT_CONTROL_VECTOR, visitor);
+        }
+    }
+
     ggml_tensor * tensor_for(int il) const;
 
     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;

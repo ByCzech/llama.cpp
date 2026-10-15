@@ -77,6 +77,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    bool visit_buffers(const llama_memory_buffer_visitor & visitor) const override;
 
     // state write/load
 

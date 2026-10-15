@@ -354,6 +354,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    add_executable(test-memory-buffers test-memory-buffers.cpp)
+    target_link_libraries(test-memory-buffers PRIVATE llama)
+    llama_test(test-memory-buffers ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-memory-buffers.gguf)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

@@ -37,6 +37,7 @@ public:
     uint32_t get_n_rows()     const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    bool visit_buffers(const llama_memory_buffer_visitor & visitor) const;
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, const std::vector<uint32_t> & rs_idx) const;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
@@ -132,6 +133,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    bool visit_buffers(const llama_memory_buffer_visitor & visitor) const override;
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;

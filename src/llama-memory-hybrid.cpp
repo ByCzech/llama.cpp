@@ -179,6 +179,12 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+bool llama_memory_hybrid::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    bool complete = mem_attn->visit_buffers(visitor);
+    complete = mem_recr->visit_buffers(visitor) && complete;
+    return complete;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {

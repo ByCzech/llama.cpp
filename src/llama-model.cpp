@@ -1247,6 +1247,7 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    std::unordered_set<ggml_backend_buffer_t> mmap_buffers;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1927,6 +1928,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
+                pimpl->mmap_buffers.insert(buf);
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
@@ -2068,6 +2070,24 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+bool llama_model::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    if (hparams.no_alloc || params.vocab_only) {
+        return false;
+    }
+    for (const auto & entry : pimpl->ctxs_bufs) {
+        for (const auto & buffer : entry.second) {
+            const auto backing = pimpl->mmap_buffers.count(buffer.get()) ?
+                LLAMA_MEMORY_BACKING_MMAP : LLAMA_MEMORY_BACKING_ALLOCATED;
+            llama_memory_visit_buffer(buffer.get(), LLAMA_MEMORY_COMPONENT_MODEL_WEIGHTS, visitor, backing);
+        }
+    }
+    return true;
+}
+
+bool llama_model_visit_buffers(const llama_model * model, const llama_memory_buffer_visitor & visitor) {
+    return model && model->visit_buffers(visitor);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

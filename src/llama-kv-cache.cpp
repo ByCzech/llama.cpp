@@ -700,6 +700,16 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+bool llama_kv_cache::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    if (hparams.no_alloc) {
+        return false;
+    }
+    for (const auto & entry : ctxs_bufs) {
+        llama_memory_visit_buffer(entry.second.get(), LLAMA_MEMORY_COMPONENT_KV_CACHE, visitor);
+    }
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {

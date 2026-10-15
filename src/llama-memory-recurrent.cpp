@@ -433,6 +433,16 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = idx;
 }
 
+bool llama_memory_recurrent::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    if (hparams.no_alloc) {
+        return false;
+    }
+    for (const auto & entry : ctxs_bufs) {
+        llama_memory_visit_buffer(entry.second.get(), LLAMA_MEMORY_COMPONENT_RECURRENT_STATE, visitor);
+    }
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {

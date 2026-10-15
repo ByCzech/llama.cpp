@@ -241,6 +241,14 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     }
 }
 
+bool llama_memory_hybrid_idx::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    bool complete = llama_memory_hybrid::visit_buffers(visitor);
+    if (mem_idx) {
+        complete = mem_idx->visit_buffers(visitor) && complete;
+    }
+    return complete;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = llama_memory_hybrid::memory_breakdown();
 

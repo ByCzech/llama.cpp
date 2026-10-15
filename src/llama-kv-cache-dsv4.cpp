@@ -1072,6 +1072,13 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
     return state_size*n_stream;
 }
 
+bool llama_dsv4_comp_state::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    for (const auto & entry : ctxs_bufs) {
+        llama_memory_visit_buffer(entry.second.get(), LLAMA_MEMORY_COMPONENT_RECURRENT_STATE, visitor);
+    }
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -1570,6 +1577,17 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return kv_raw->seq_pos_max(seq_id);
+}
+
+bool llama_kv_cache_dsv4::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    bool complete = kv_raw->visit_buffers(visitor);
+    complete = kv_csa->visit_buffers(visitor) && complete;
+    complete = kv_hca->visit_buffers(visitor) && complete;
+    complete = kv_lid->visit_buffers(visitor) && complete;
+    complete = csa_state->visit_buffers(visitor) && complete;
+    complete = hca_state->visit_buffers(visitor) && complete;
+    complete = lid_state->visit_buffers(visitor) && complete;
+    return complete;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {

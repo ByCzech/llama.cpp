@@ -3571,6 +3571,37 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+bool llama_context::visit_buffers(const llama_memory_buffer_visitor & visitor) const {
+    if (model.hparams.no_alloc) {
+        return false;
+    }
+    const bool complete = !memory || memory->visit_buffers(visitor);
+    if (moe_cache) {
+        moe_cache->visit_buffers(visitor);
+    }
+    if (cvec) {
+        cvec->visit_buffers(visitor);
+    }
+    if (sched) {
+        auto collect_compute = [](ggml_backend_buffer_t buffer, void * user_data) {
+            const auto & visitor = *(const llama_memory_buffer_visitor *) user_data;
+            visitor({buffer, LLAMA_MEMORY_COMPONENT_COMPUTE, LLAMA_MEMORY_BACKING_ALLOCATED});
+        };
+        ggml_backend_sched_visit_buffers(sched.get(), collect_compute, (void *) &visitor);
+    }
+    llama_memory_visit_buffer(buf_output.get(), LLAMA_MEMORY_COMPONENT_OUTPUT, visitor);
+    for (const auto & sequence : mem_storage) {
+        for (const auto & entry : sequence.second) {
+            llama_memory_visit_buffer(entry.second.buf.get(), LLAMA_MEMORY_COMPONENT_STATE_OTHER, visitor);
+        }
+    }
+    return complete;
+}
+
+bool llama_context_visit_buffers(const llama_context * ctx, const llama_memory_buffer_visitor & visitor) {
+    return ctx && ctx->visit_buffers(visitor);
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-memory-view.h"
 #include "llama-graph.h"
 
 #include <map>
@@ -117,6 +118,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // State implementations without an inspector report unknown coverage.
+    virtual bool visit_buffers(const llama_memory_buffer_visitor &) const { return false; }
 
     //
     // state write/read

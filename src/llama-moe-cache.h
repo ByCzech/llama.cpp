@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "llama-memory-view.h"
 
 #include <map>
 #include <memory>
@@ -33,6 +34,7 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    void visit_buffers(const llama_memory_buffer_visitor & visitor) const;
 
 private:
     struct impl;
