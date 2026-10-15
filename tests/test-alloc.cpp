@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "ggml-backend-memory.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-impl.h"
@@ -1106,7 +1107,113 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+static void collect_buffer(ggml_backend_buffer_t buffer, void * user_data) {
+    auto & buffers = *(std::vector<ggml_backend_buffer_t> *) user_data;
+    GGML_ASSERT(!ggml_backend_buffer_is_multi_buffer(buffer));
+    buffers.push_back(buffer);
+}
+
+static void check_visited_buffers(
+        const std::vector<ggml_backend_buffer_t> & visited, const dummy_backend & backend) {
+    const auto & allocated = backend.context->buffers;
+    GGML_ASSERT(visited.size() == allocated.size());
+    size_t total = 0;
+    for (ggml_backend_buffer_t buffer : allocated) {
+        GGML_ASSERT(std::count(visited.begin(), visited.end(), buffer) == 1);
+        total += ggml_backend_buffer_get_size(buffer);
+    }
+    GGML_ASSERT(total == backend.context->allocated_total());
+}
+
+static void test_visit_multi_buffer() {
+    dummy_backend backend = dummy_backend_init(64);
+    ggml_backend_buffer_t a = ggml_backend_buft_alloc_buffer(&backend.buffer_type, 16);
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(&backend.buffer_type, 24);
+    ggml_backend_buffer_t zero = ggml_backend_buft_alloc_buffer(&backend.buffer_type, 0);
+    ggml_backend_buffer_t inner_leaves[] = {a, b};
+    ggml_backend_buffer_t inner = ggml_backend_multi_buffer_alloc_buffer(inner_leaves, 2);
+    ggml_backend_buffer_t outer_leaves[] = {inner, zero};
+    ggml_backend_buffer_ptr outer(ggml_backend_multi_buffer_alloc_buffer(outer_leaves, 2));
+
+    std::vector<ggml_backend_buffer_t> visited;
+    ggml_backend_buffer_visit(nullptr, collect_buffer, &visited);
+    GGML_ASSERT(visited.empty());
+    ggml_backend_buffer_visit(outer.get(), collect_buffer, &visited);
+    GGML_ASSERT(visited == std::vector<ggml_backend_buffer_t>({a, b, zero}));
+    GGML_ASSERT(ggml_backend_buffer_get_size(a) + ggml_backend_buffer_get_size(b) == 40);
+    GGML_ASSERT(ggml_backend_buffer_get_size(zero) == 0);
+    GGML_ASSERT(backend.context->buffers.size() == 2);
+    outer.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
+static void test_visit_allocator_buffers() {
+    dummy_backend backend = dummy_backend_init(32);
+    ggml_backend_buffer_type_t bufts[] = {&backend.buffer_type, &backend.buffer_type};
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 2));
+    std::vector<ggml_backend_buffer_t> visited;
+    ggml_gallocr_visit_buffers(galloc.get(), collect_buffer, &visited);
+    GGML_ASSERT(visited.empty());
+
+    for (size_t size : {32, 64}) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * a = make_input_with_size(ctx, size);
+        ggml_tensor * b = make_input_with_size(ctx, size);
+        ggml_tensor * result = ggml_add(ctx, a, b);
+        ggml_set_output(result);
+        ggml_build_forward_expand(graph, result);
+        GGML_ASSERT(graph->n_nodes == 1 && graph->n_leafs == 2);
+        const int nodes[] = {1};
+        const int leaves[] = {0, 1};
+        GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, nodes, leaves));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        GGML_ASSERT(backend.context->buffers.size() >= 2);
+
+        const auto allocated_before = backend.context->buffers;
+        visited.clear();
+        ggml_gallocr_visit_buffers(galloc.get(), collect_buffer, &visited);
+        check_visited_buffers(visited, backend);
+        GGML_ASSERT(backend.context->buffers == allocated_before);
+        GGML_ASSERT(std::find(visited.begin(), visited.end(), a->buffer) != visited.end());
+        GGML_ASSERT(std::find(visited.begin(), visited.end(), b->buffer) != visited.end());
+        GGML_ASSERT(std::find(visited.begin(), visited.end(), result->buffer) != visited.end());
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(galloc.get(), 0) == backend.context->allocated_total());
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(galloc.get(), 1) == 0);
+    }
+    galloc.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
+static void test_visit_scheduler_buffers() {
+    dummy_backend backend = dummy_backend_init(32);
+    ggml_backend_t backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true));
+    std::vector<ggml_backend_buffer_t> visited;
+    ggml_backend_sched_visit_buffers(sched.get(), collect_buffer, &visited);
+    GGML_ASSERT(visited.empty());
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * a = make_input_with_size(ctx, 32);
+    ggml_tensor * b = make_input_with_size(ctx, 32);
+    ggml_tensor * result = ggml_add(ctx, a, b);
+    ggml_set_output(result);
+    ggml_build_forward_expand(graph, result);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    const auto allocated_before = backend.context->buffers;
+    ggml_backend_sched_visit_buffers(sched.get(), collect_buffer, &visited);
+    GGML_ASSERT(visited.size() >= 2);
+    check_visited_buffers(visited, backend);
+    GGML_ASSERT(backend.context->buffers == allocated_before);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched.get(), backend_ptr) == backend.context->allocated_total());
+    sched.reset();
+    GGML_ASSERT(backend.context->buffers.empty());
+}
+
 int main() {
+    run("test_visit_multi_buffer", test_visit_multi_buffer);
+    run("test_visit_allocator_buffers", test_visit_allocator_buffers);
+    run("test_visit_scheduler_buffers", test_visit_scheduler_buffers);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

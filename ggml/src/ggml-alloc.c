@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "ggml-backend-memory.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -1113,6 +1114,31 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+void ggml_gallocr_visit_buffers(
+        ggml_gallocr_t galloc, ggml_backend_buffer_visit_callback callback, void * user_data) {
+    GGML_ASSERT(galloc);
+    GGML_ASSERT(callback);
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        const struct vbuffer * buffer = galloc->buffers[i];
+        if (buffer == NULL) {
+            continue;
+        }
+        bool shared = false;
+        for (int j = 0; j < i; ++j) {
+            if (galloc->buffers[j] == buffer) {
+                shared = true;
+                break;
+            }
+        }
+        if (shared) {
+            continue;
+        }
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; ++c) {
+            ggml_backend_buffer_visit(buffer->chunks[c], callback, user_data);
+        }
+    }
 }
 
 // utils

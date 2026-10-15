@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-backend-memory.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -874,6 +875,22 @@ ggml_backend_buffer_t ggml_backend_multi_buffer_alloc_buffer(ggml_backend_buffer
 bool ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
     return buffer->iface.free_buffer == ggml_backend_multi_buffer_free_buffer;
+}
+
+void ggml_backend_buffer_visit(
+        ggml_backend_buffer_t buffer, ggml_backend_buffer_visit_callback callback, void * user_data) {
+    GGML_ASSERT(callback);
+    if (buffer == nullptr) {
+        return;
+    }
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        const auto * ctx = (const ggml_backend_multi_buffer_context *) buffer->context;
+        for (size_t i = 0; i < ctx->n_buffers; ++i) {
+            ggml_backend_buffer_visit(ctx->buffers[i], callback, user_data);
+        }
+    } else {
+        callback(buffer, user_data);
+    }
 }
 
 void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
@@ -2178,6 +2195,12 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+void ggml_backend_sched_visit_buffers(
+        ggml_backend_sched_t sched, ggml_backend_buffer_visit_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_visit_buffers(sched->galloc, callback, user_data);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
