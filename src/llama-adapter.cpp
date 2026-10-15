@@ -422,6 +422,16 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
 }
 
+bool llama_adapter_lora_visit_buffers(const llama_adapter_lora * adapter, const llama_memory_buffer_visitor & visitor) {
+    if (!adapter) {
+        return false;
+    }
+    for (const auto & buffer : adapter->bufs) {
+        llama_memory_visit_buffer(buffer.get(), LLAMA_MEMORY_COMPONENT_ADAPTER_WEIGHTS, visitor);
+    }
+    return true;
+}
+
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 

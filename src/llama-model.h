@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-memory-placement.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -774,6 +775,7 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
     bool visit_buffers(const llama_memory_buffer_visitor & visitor) const;
+    bool visit_placement(const llama_memory_placement_visitor & visitor) const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;

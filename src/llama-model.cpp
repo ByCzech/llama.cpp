@@ -1248,6 +1248,7 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
     std::unordered_set<ggml_backend_buffer_t> mmap_buffers;
+    std::vector<llama_memory_tensor_role> memory_tensor_roles;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -2026,9 +2027,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
-    return ml.create_tensor(
+    auto * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    llama_memory_record_tensor_role(pimpl->memory_tensor_roles, tensor, tn,
+        (flags & TENSOR_DUPLICATED) != 0, hparams.n_layer(), hparams.n_layer_all);
+    return tensor;
 }
 
 std::string llama_model::arch_name() const {
@@ -2088,6 +2092,28 @@ bool llama_model::visit_buffers(const llama_memory_buffer_visitor & visitor) con
 
 bool llama_model_visit_buffers(const llama_model * model, const llama_memory_buffer_visitor & visitor) {
     return model && model->visit_buffers(visitor);
+}
+
+bool llama_model::visit_placement(const llama_memory_placement_visitor & visitor) const {
+    if (hparams.no_alloc || params.vocab_only) {
+        return false;
+    }
+    return llama_memory_visit_tensor_roles(pimpl->memory_tensor_roles, tensors_by_name,
+        hparams.n_layer(), params.load_mtp ? hparams.n_layer_all : hparams.n_layer(), visitor);
+}
+
+bool llama_model_visit_placement(const llama_model * model, const llama_memory_placement_visitor & visitor) {
+    return model && model->visit_placement(visitor);
+}
+
+bool llama_model_visit_loras(const llama_model * model, const llama_memory_lora_visitor & visitor) {
+    if (!model) {
+        return false;
+    }
+    for (const auto * adapter : model->loras) {
+        visitor(adapter);
+    }
+    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

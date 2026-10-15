@@ -1,6 +1,7 @@
 #include "clip.h"
 #include "clip-impl.h"
 #include "mtmd.h"
+#include "mtmd-memory.h"
 #include "mtmd-internal.h"
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
@@ -2932,6 +2933,22 @@ void mtmd_debug_preprocess_audio(mtmd_context * ctx, const std::vector<float> & 
 
 static void stub_log_callback(enum ggml_log_level, const char *, void *) {
     // do nothing
+}
+
+bool mtmd_visit_projectors(const mtmd_context * ctx, const mtmd_memory_projector_visitor & visitor) {
+    if (!ctx) {
+        return false;
+    }
+    if (ctx->ctx_v) {
+        visitor(ctx->ctx_v, MTMD_MEMORY_ROLE_VISION);
+    }
+    if (ctx->ctx_a) {
+        visitor(ctx->ctx_a, MTMD_MEMORY_ROLE_AUDIO);
+    }
+    if (ctx->ctx_gen_a) {
+        visitor(ctx->ctx_gen_a, MTMD_MEMORY_ROLE_AUDIO_GENERATION);
+    }
+    return true;
 }
 
 mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,

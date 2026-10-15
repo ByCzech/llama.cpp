@@ -16,6 +16,9 @@ enum llama_memory_component {
     LLAMA_MEMORY_COMPONENT_OUTPUT,
     LLAMA_MEMORY_COMPONENT_MOE_CACHE,
     LLAMA_MEMORY_COMPONENT_CONTROL_VECTOR,
+    LLAMA_MEMORY_COMPONENT_ADAPTER_WEIGHTS,
+    LLAMA_MEMORY_COMPONENT_PROJECTOR_WEIGHTS,
+    LLAMA_MEMORY_COMPONENT_PROJECTOR_COMPUTE,
 };
 
 enum llama_memory_backing {
@@ -55,3 +58,8 @@ LLAMA_API bool llama_model_visit_buffers(const llama_model * model, const llama_
 // Does not revisit model weights. No state is a valid case (for example embeddings).
 // False can accompany partial results if the state implementation is unsupported.
 LLAMA_API bool llama_context_visit_buffers(const llama_context * ctx, const llama_memory_buffer_visitor & visitor);
+
+// Loaded adapters are resident owners even when they are not currently selected by a context.
+using llama_memory_lora_visitor = std::function<void(const llama_adapter_lora *)>;
+LLAMA_API bool llama_model_visit_loras(const llama_model * model, const llama_memory_lora_visitor & visitor);
+LLAMA_API bool llama_adapter_lora_visit_buffers(const llama_adapter_lora * adapter, const llama_memory_buffer_visitor & visitor);

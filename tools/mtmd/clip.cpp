@@ -1,4 +1,5 @@
 #include "clip.h"
+#include "mtmd-memory.h"
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
@@ -6242,6 +6243,21 @@ projector_type clip_get_projector_type(const struct clip_ctx * ctx) {
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
     return &ctx->model.hparams;
+}
+
+bool clip_visit_buffers(const clip_ctx * ctx, const llama_memory_buffer_visitor & visitor) {
+    if (!ctx || ctx->no_alloc || !ctx->buf) {
+        return false;
+    }
+    llama_memory_visit_buffer(ctx->buf.get(), LLAMA_MEMORY_COMPONENT_PROJECTOR_WEIGHTS, visitor);
+    if (ctx->sched) {
+        auto collect_compute = [](ggml_backend_buffer_t buffer, void * user_data) {
+            const auto & visitor = *(const llama_memory_buffer_visitor *) user_data;
+            visitor({buffer, LLAMA_MEMORY_COMPONENT_PROJECTOR_COMPUTE, LLAMA_MEMORY_BACKING_ALLOCATED});
+        };
+        ggml_backend_sched_visit_buffers(ctx->sched.get(), collect_compute, (void *) &visitor);
+    }
+    return true;
 }
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {

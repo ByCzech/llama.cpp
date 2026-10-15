@@ -2,6 +2,8 @@
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-memory-view.h"
+#include "../src/llama-memory-placement.h"
+#include "../src/llama-adapter.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
 
@@ -135,6 +137,135 @@ static void check_native_sizes(const llama_context * ctx, const inventory & weig
     GGML_ASSERT(actual.empty());
 }
 
+static void check_placement(const llama_model * model, int32_t expected_layers, bool mtp = false) {
+    std::set<int32_t> layers;
+    std::set<int32_t> mtp_layers;
+    bool input = false;
+    bool output = false;
+    GGML_ASSERT(llama_model_visit_placement(model, [&](const llama_memory_placement_view & view) {
+        GGML_ASSERT(view.known && view.buffer);
+        GGML_ASSERT(ggml_backend_buffer_is_host(view.buffer));
+        if (view.part == LLAMA_MEMORY_MODEL_PART_REPEATING) {
+            layers.insert(view.layer);
+        } else if (view.part == LLAMA_MEMORY_MODEL_PART_MTP) {
+            mtp_layers.insert(view.layer);
+        } else if (view.part == LLAMA_MEMORY_MODEL_PART_INPUT) {
+            input = true;
+        } else if (view.part == LLAMA_MEMORY_MODEL_PART_OUTPUT) {
+            output = true;
+        }
+    }));
+    GGML_ASSERT(input && output);
+    GGML_ASSERT(layers.size() == (size_t) expected_layers);
+    for (int32_t layer = 0; layer < expected_layers; ++layer) {
+        GGML_ASSERT(layers.count(layer) == 1);
+    }
+    GGML_ASSERT(mtp_layers.size() == (mtp ? 1u : 0u));
+    if (mtp) {
+        GGML_ASSERT(mtp_layers.count(expected_layers) == 1);
+    }
+}
+
+static void test_lora(llama_model * model) {
+    ggml_context_ptr tensors(ggml_init({65536, nullptr, false}));
+    gguf_context_ptr data(gguf_init_empty());
+    gguf_set_val_str(data.get(), "general.architecture", "llama");
+    gguf_set_val_str(data.get(), "general.type", "adapter");
+    gguf_set_val_str(data.get(), "adapter.type", "lora");
+    gguf_set_val_f32(data.get(), "adapter.lora.alpha", 2.0f);
+    auto * a = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 64, 2);
+    auto * b = ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, 2, 64);
+    ggml_set_name(a, "blk.0.attn_q.weight.lora_a");
+    ggml_set_name(b, "blk.0.attn_q.weight.lora_b");
+    ggml_set_f32(a, 0.01f);
+    ggml_set_f32(b, 0.01f);
+    gguf_add_tensor(data.get(), a);
+    gguf_add_tensor(data.get(), b);
+    FILE * file = std::tmpfile();
+    GGML_ASSERT(file && gguf_write_to_file_ptr(data.get(), file, false));
+    std::rewind(file);
+    auto * adapter = llama_adapter_lora_init_from_file_ptr(model, file);
+    std::fclose(file);
+    GGML_ASSERT(adapter);
+    size_t owners = 0;
+    GGML_ASSERT(llama_model_visit_loras(model, [&](const llama_adapter_lora * found) {
+        GGML_ASSERT(found == adapter);
+        ++owners;
+    }));
+    GGML_ASSERT(owners == 1);
+    inventory buffers;
+    GGML_ASSERT(llama_adapter_lora_visit_buffers(adapter, [&](const llama_memory_buffer_view & view) { record(buffers, view); }));
+    size_t actual = 0;
+    for (const auto & buffer : adapter->bufs) {
+        GGML_ASSERT(buffers.count(buffer.get()) == 1);
+        actual += ggml_backend_buffer_get_size(buffer.get());
+    }
+    GGML_ASSERT(actual > 0 && bytes(buffers, LLAMA_MEMORY_COMPONENT_ADAPTER_WEIGHTS) == actual);
+    llama_adapter_lora_free(adapter);
+    GGML_ASSERT(llama_model_visit_loras(model, [&](const llama_adapter_lora *) { GGML_ABORT("freed adapter visited"); }));
+}
+
+static void test_tied_output(const char * path) {
+    ggml_context * raw_tensors = nullptr;
+    gguf_context_ptr source(gguf_init_from_file(path, {false, &raw_tensors}));
+    ggml_context_ptr tensors(raw_tensors);
+    GGML_ASSERT(source && tensors);
+    gguf_context_ptr tied(gguf_init_empty());
+    gguf_set_kv(tied.get(), source.get());
+    for (int64_t i = 0; i < gguf_get_n_tensors(source.get()); ++i) {
+        auto * tensor = ggml_get_tensor(tensors.get(), gguf_get_tensor_name(source.get(), i));
+        GGML_ASSERT(tensor);
+        if (std::string(tensor->name) != "output.weight") {
+            gguf_add_tensor(tied.get(), tensor);
+        }
+    }
+    const auto tied_path = std::string(path) + ".tied";
+    GGML_ASSERT(gguf_write_to_file(tied.get(), tied_path.c_str(), false));
+    llama_model_ptr model(llama_model_load_from_file(tied_path.c_str(), model_params()));
+    GGML_ASSERT(model);
+    check_placement(model.get(), 2);
+    size_t output_roles = 0;
+    GGML_ASSERT(llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) {
+        output_roles += view.part == LLAMA_MEMORY_MODEL_PART_OUTPUT ? 1 : 0;
+    }));
+    GGML_ASSERT(output_roles >= 2); // output norm and the aliased embedding weight
+    model.reset();
+    GGML_ASSERT(std::remove(tied_path.c_str()) == 0);
+}
+
+struct placement_init_data {
+    std::set<ggml_backend_buffer_t> buffers;
+    ggml_tensor * tensor = nullptr;
+};
+
+static void test_missing_placement() {
+    auto data = metadata("llama");
+    placement_init_data initialized;
+    llama_model_ptr model(llama_model_init_from_user(data.get(), [](ggml_tensor * tensor, void * user_data) {
+        auto & data = *(placement_init_data *) user_data;
+        initialize_tensor(tensor, &data.buffers);
+        data.tensor = tensor;
+    }, &initialized, model_params()));
+    GGML_ASSERT(model && initialized.tensor);
+    auto * tensor = initialized.tensor;
+    auto * buffer = tensor->buffer;
+    tensor->buffer = nullptr;
+    size_t unknown = 0;
+    GGML_ASSERT(!llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) {
+        if (!view.known) {
+            GGML_ASSERT(view.buffer == nullptr);
+            ++unknown;
+        }
+    }));
+    GGML_ASSERT(unknown > 0);
+    ggml_tensor source = {};
+    source.buffer = buffer;
+    tensor->view_src = &source;
+    check_placement(model.get(), 2);
+    tensor->view_src = nullptr;
+    tensor->buffer = buffer;
+}
+
 static void test_model(const std::string & arch, const char * model_path) {
     auto data = metadata(arch);
     std::set<ggml_backend_buffer_t> initialized;
@@ -149,6 +280,7 @@ static void test_model(const std::string & arch, const char * model_path) {
     }));
     GGML_ASSERT(weights.size() == initialized.size());
     GGML_ASSERT(bytes(weights, LLAMA_MEMORY_COMPONENT_MODEL_WEIGHTS) > 0);
+    check_placement(model.get(), 2);
     auto ctx = context(model.get(), arch == "bert");
     const auto initial = inspect(ctx.get());
     GGML_ASSERT(bytes(initial, LLAMA_MEMORY_COMPONENT_OUTPUT) > 0);
@@ -163,6 +295,7 @@ static void test_model(const std::string & arch, const char * model_path) {
     }
 
     if (arch == "llama") {
+        test_lora(model.get());
         // The same model can have multiple contexts without creating another weight allocation.
         auto ctx_other = context(model.get());
         inventory shared_weights;
@@ -200,6 +333,7 @@ static void test_model(const std::string & arch, const char * model_path) {
         llama_model_save_to_file(model.get(), model_path);
         for (bool mmap : {false, true}) {
             auto params = model_params();
+            params.n_gpu_layers = 99; // the explicit empty device list still puts real weights on CPU
             params.load_mode = mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
             llama_model_ptr loaded(llama_model_load_from_file(model_path, params));
             GGML_ASSERT(loaded);
@@ -209,7 +343,9 @@ static void test_model(const std::string & arch, const char * model_path) {
                 total += ggml_backend_buffer_get_size(view.buffer);
             }));
             GGML_ASSERT(total > 0);
+            check_placement(loaded.get(), 2);
         }
+        test_tied_output(model_path);
         GGML_ASSERT(std::remove(model_path) == 0);
     }
     auto params = model_params();
@@ -218,6 +354,8 @@ static void test_model(const std::string & arch, const char * model_path) {
     GGML_ASSERT(preflight);
     bool visited = false;
     GGML_ASSERT(!llama_model_visit_buffers(preflight.get(), [&](const llama_memory_buffer_view &) { visited = true; }));
+    GGML_ASSERT(!visited);
+    GGML_ASSERT(!llama_model_visit_placement(preflight.get(), [&](const llama_memory_placement_view &) { visited = true; }));
     GGML_ASSERT(!visited);
     std::printf("memory buffers: %s PASSED\n", arch.c_str());
 }
@@ -234,6 +372,19 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(!llama_context_visit_buffers(nullptr, [](const llama_memory_buffer_view &) {}));
     for (const auto & arch : {"llama", "qwen35", "bert"}) {
         test_model(arch, argv[1]);
+    }
+    test_missing_placement();
+    {
+        auto data = metadata("qwen35");
+        gguf_set_val_u32(data.get(), "qwen35.block_count", 3);
+        gguf_set_val_u32(data.get(), "qwen35.nextn_predict_layers", 1);
+        std::set<ggml_backend_buffer_t> initialized;
+        auto params = model_params();
+        params.load_mtp = true;
+        llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, params));
+        GGML_ASSERT(model);
+        check_placement(model.get(), 2, true);
+        std::puts("memory placement: MTP PASSED");
     }
     llama_backend_free();
 }
