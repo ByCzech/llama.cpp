@@ -362,6 +362,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
         find_package(Threads REQUIRED)
         add_library(test-memory-report-support STATIC
             ../tools/server/server-memory.cpp
+            ../tools/server/server-memory-snapshot.cpp
             ../common/json.cpp)
         target_link_libraries(test-memory-report-support PUBLIC llama mtmd llama-common-base vendor::nlohmann)
         target_link_libraries(test-memory-buffers PRIVATE test-memory-report-support)
@@ -370,6 +371,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
         target_link_libraries(test-memory-report PRIVATE test-memory-report-support Threads::Threads)
         llama_test(test-memory-report)
         set_tests_properties(test-memory-report PROPERTIES TIMEOUT 30)
+        add_executable(test-memory-snapshot test-memory-snapshot.cpp)
+        target_link_libraries(test-memory-snapshot PRIVATE test-memory-report-support Threads::Threads)
+        llama_test(test-memory-snapshot)
+        set_tests_properties(test-memory-snapshot PROPERTIES TIMEOUT 30)
     endif()
 endif()
 
