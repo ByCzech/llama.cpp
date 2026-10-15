@@ -1,4 +1,5 @@
 #include "ggml-vulkan-common.h"
+#include "ggml-backend-memory.h"
 
 namespace {
 inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
@@ -16185,11 +16186,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static uint32_t ggml_backend_vk_memory_buffer_flags(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_vk_host_buffer_free_buffer ? GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED : 0;
+}
+
+static void * ggml_backend_vk_memory_proc(ggml_backend_reg_t, const char * name) {
+    return strcmp(name, "tllama_buffer_memory_flags") == 0 ? (void *) ggml_backend_vk_memory_buffer_flags : nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_memory_proc,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

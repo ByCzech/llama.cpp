@@ -10,6 +10,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 
+#include "ggml-backend-memory.h"
+
 #include <algorithm>
 #include <array>
 #include <assert.h>
@@ -7491,7 +7493,15 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 catch (const sycl::exception &) { return false; }
 catch (...)                     { return false; }
 
+static uint32_t ggml_backend_sycl_memory_buffer_flags(ggml_backend_buffer_t buffer) {
+    // Host buffers can use either pinned or plain allocation. Do not infer pinning from their type.
+    return buffer->buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name ? GGML_BACKEND_MEMORY_BUFFER_OPAQUE : 0;
+}
+
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
+    if (strcmp(name, "tllama_buffer_memory_flags") == 0) {
+        return (void *) ggml_backend_sycl_memory_buffer_flags;
+    }
     GGML_UNUSED(reg);
 
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {

@@ -2633,3 +2633,36 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
+
+// TLlama memory inspection. The generic CPU buffer types do not carry a device pointer.
+ggml_backend_dev_t ggml_backend_memory_buffer_device(ggml_backend_buffer_t buffer) {
+    if (!buffer) {
+        return nullptr;
+    }
+    auto * buft = ggml_backend_buffer_get_type(buffer);
+    auto * device = ggml_backend_buft_get_device(buft);
+    if (!device && (buft == ggml_backend_cpu_buffer_type() || buft == ggml_backend_cpu_buffer_from_ptr_type())) {
+        device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return device;
+}
+
+uint32_t ggml_backend_memory_buffer_flags(ggml_backend_buffer_t buffer) {
+    if (!buffer) {
+        return 0;
+    }
+    if (ggml_backend_buffer_is_meta(buffer)) {
+        return GGML_BACKEND_MEMORY_BUFFER_OPAQUE;
+    }
+    auto * device = ggml_backend_memory_buffer_device(buffer);
+    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    if (!reg) {
+        return 0;
+    }
+    auto inspect = (ggml_backend_memory_buffer_flags_t) ggml_backend_reg_get_proc_address(reg, "tllama_buffer_memory_flags");
+    if (inspect) {
+        return inspect(buffer);
+    }
+    // Old split backends cannot prove that their objects are leaf allocations.
+    return ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type") ? GGML_BACKEND_MEMORY_BUFFER_OPAQUE : 0;
+}
