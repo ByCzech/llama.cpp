@@ -6,6 +6,9 @@
 #include "../src/llama-adapter.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+#include "../tools/server/server-memory.h"
+#endif
 
 #include <cstdio>
 #include <map>
@@ -43,6 +46,43 @@ static inventory inspect(const llama_context * ctx) {
     GGML_ASSERT(llama_context_visit_buffers(ctx, [&](const llama_memory_buffer_view & view) { record(result, view); }));
     return result;
 }
+
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+static void check_report(server_memory_native & collector, const server_memory_sources & sources, bool mapped = false) {
+    std::map<ggml_backend_buffer_t, size_t> native;
+    const auto collect = [&](const llama_memory_buffer_view & view) {
+        native[view.buffer] = ggml_backend_buffer_get_size(view.buffer);
+    };
+    GGML_ASSERT(llama_model_visit_buffers(llama_get_model(sources.main), collect));
+    GGML_ASSERT(llama_context_visit_buffers(sources.main, collect));
+    if (sources.draft) {
+        GGML_ASSERT(llama_model_visit_buffers(llama_get_model(sources.draft), collect));
+        GGML_ASSERT(llama_context_visit_buffers(sources.draft, collect));
+    }
+    uint64_t expected = 0;
+    for (const auto & entry : native) { expected += entry.second; }
+    const auto report = collector.capture(sources);
+    GGML_ASSERT(report["status"] == "known");
+    GGML_ASSERT(report["placement"]["status"] == "known");
+    GGML_ASSERT(report["buffers"].size() == native.size());
+    uint64_t actual = 0;
+    size_t mapped_buffers = 0, model_owners = 0;
+    for (const auto & buffer : report["buffers"]) {
+        GGML_ASSERT(buffer["memory_kind"] == "host");
+        actual += buffer["size_bytes"].get<uint64_t>();
+        mapped_buffers += buffer["backing"] == "mmap" ? 1 : 0;
+    }
+    for (const auto & owner : report["owners"]) {
+        if (owner["kind"] == "model") {
+            ++model_owners;
+            GGML_ASSERT(owner["roles"].size() == (sources.draft ? 2 : 1));
+        }
+    }
+    GGML_ASSERT(model_owners == 1); // both test contexts share their actual model
+    GGML_ASSERT(actual == expected);
+    GGML_ASSERT((mapped_buffers > 0) == mapped);
+}
+#endif
 
 static gguf_context_ptr metadata(const std::string & arch) {
     gguf_context_ptr data(gguf_init_empty());
@@ -288,6 +328,10 @@ static void test_model(const std::string & arch, const char * model_path) {
     GGML_ASSERT((bytes(initial, LLAMA_MEMORY_COMPONENT_KV_CACHE) > 0) == (arch != "bert"));
     GGML_ASSERT((bytes(initial, LLAMA_MEMORY_COMPONENT_RECURRENT_STATE) > 0) == (arch == "qwen35"));
     check_native_sizes(ctx.get(), weights, initial);
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+    server_memory_native collector;
+    check_report(collector, {ctx.get()});
+#endif
     const auto repeated = inspect(ctx.get());
     GGML_ASSERT(repeated.size() == initial.size());
     for (const auto & entry : initial) {
@@ -298,6 +342,9 @@ static void test_model(const std::string & arch, const char * model_path) {
         test_lora(model.get());
         // The same model can have multiple contexts without creating another weight allocation.
         auto ctx_other = context(model.get());
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+        check_report(collector, {ctx.get(), ctx_other.get(), nullptr, true});
+#endif
         inventory shared_weights;
         GGML_ASSERT(llama_model_visit_buffers(model.get(), [&](const llama_memory_buffer_view & view) { record(shared_weights, view); }));
         GGML_ASSERT(shared_weights.size() == initialized.size());
@@ -329,6 +376,11 @@ static void test_model(const std::string & arch, const char * model_path) {
         std::vector<float> control(64, 0.01f);
         GGML_ASSERT(llama_set_adapter_cvec(ctx.get(), control.data(), control.size(), 64, 1, 1) == 0);
         GGML_ASSERT(bytes(inspect(ctx.get()), LLAMA_MEMORY_COMPONENT_CONTROL_VECTOR) > 0);
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+        // Static weights stay cached; output, saved state and control-vector allocations must refresh.
+        check_report(collector, {ctx.get(), ctx_other.get(), nullptr, true});
+        collector.reset(); // before either owner is released
+#endif
 
         llama_model_save_to_file(model.get(), model_path);
         for (bool mmap : {false, true}) {
@@ -344,6 +396,12 @@ static void test_model(const std::string & arch, const char * model_path) {
             }));
             GGML_ASSERT(total > 0);
             check_placement(loaded.get(), 2);
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+            auto loaded_ctx = context(loaded.get());
+            server_memory_native mapped_collector;
+            check_report(mapped_collector, {loaded_ctx.get()}, mmap);
+            mapped_collector.reset();
+#endif
         }
         test_tied_output(model_path);
         GGML_ASSERT(std::remove(model_path) == 0);
