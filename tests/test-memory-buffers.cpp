@@ -419,13 +419,21 @@ static void test_model(const std::string & arch, const char * model_path) {
 }
 
 int main(int argc, char ** argv) {
-    GGML_ASSERT(argc == 2);
+    GGML_ASSERT(argc == 2 || (argc == 3 && std::string(argv[1]) == "--write-model"));
     llama_log_set([](ggml_log_level level, const char * text, void *) {
         if (level == GGML_LOG_LEVEL_ERROR) {
             std::fputs(text, stderr);
         }
     }, nullptr);
     llama_backend_init();
+    if (argc == 3) {
+        auto data = metadata("llama");
+        std::set<ggml_backend_buffer_t> initialized;
+        llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, model_params()));
+        GGML_ASSERT(model);
+        llama_model_save_to_file(model.get(), argv[2]);
+        return 0;
+    }
     GGML_ASSERT(!llama_model_visit_buffers(nullptr, [](const llama_memory_buffer_view &) {}));
     GGML_ASSERT(!llama_context_visit_buffers(nullptr, [](const llama_memory_buffer_view &) {}));
     for (const auto & arch : {"llama", "qwen35", "bert"}) {

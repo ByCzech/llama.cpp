@@ -71,3 +71,14 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (LLAMA_BUILD_TESTS AND TARGET test-memory-buffers)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-memory-http
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-memory-http.py
+                --server $<TARGET_FILE:llama-server>
+                --fixture-generator $<TARGET_FILE:test-memory-buffers>)
+        set_tests_properties(test-memory-http PROPERTIES TIMEOUT 90)
+    endif()
+endif()

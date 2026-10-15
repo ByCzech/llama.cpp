@@ -46,6 +46,11 @@ static void test_lifecycle() {
     GGML_ASSERT(reporter.read()["snapshot_age_ms"].get<uint64_t>() >= age);
     reporter.transition("failed", "after_load_failure");
     GGML_ASSERT(reporter.read()["status"] == "unavailable");
+    reporter.transition("loaded", "after_batch", false, "collection_failed");
+    const auto failed_collection = reporter.read();
+    GGML_ASSERT(failed_collection["status"] == "unavailable");
+    GGML_ASSERT(failed_collection["buffers"].empty());
+    GGML_ASSERT(failed_collection["missing_components"][0]["reason"] == "collection_failed");
 }
 
 static void test_concurrent_reads() {

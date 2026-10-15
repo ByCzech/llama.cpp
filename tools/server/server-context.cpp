@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-memory-snapshot.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -969,6 +970,10 @@ public:
         return metrics;
     }
 
+    json get_memory_report() const {
+        return memory_reporter.read();
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -1034,9 +1039,27 @@ private:
 
     bool sleeping = false;
 
+    server_memory_reporter memory_reporter;
+    bool memory_request_finished = false;
+    bool memory_draft_is_mtp = false;
+
+    void capture_memory(const char * stage, bool force = false) {
+        if (!ctx_tgt) {
+            return;
+        }
+        try {
+            memory_reporter.capture({ctx_tgt, ctx_dft, mctx, memory_draft_is_mtp}, stage, force);
+        } catch (const std::exception & e) {
+            SRV_WRN("memory collection failed: %s\n", e.what());
+            memory_reporter.transition("loaded", stage, false, "collection_failed");
+        }
+    }
+
     int64_t t_last_load_progress_ms = 0;
 
-    void destroy() {
+    void destroy(const char * state_after = "unloaded") {
+        memory_reporter.transition("unloading", "before_unload");
+        memory_request_finished = false;
         spec.reset();
         spec_init.reset();
 
@@ -1050,6 +1073,7 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+        memory_reporter.transition(state_after, "after_unload", true);
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1060,7 +1084,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
-            destroy();
+            destroy("sleeping");
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
@@ -1105,6 +1129,20 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        memory_reporter.transition("loading", "before_load");
+        try {
+            if (load_model_impl(params)) {
+                return true;
+            }
+        } catch (...) {
+            memory_reporter.transition("failed", "after_load_failure");
+            throw;
+        }
+        memory_reporter.transition("failed", "after_load_failure");
+        return false;
+    }
+
+    bool load_model_impl(common_params & params) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -1122,6 +1160,7 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        memory_draft_is_mtp = spec_mtp;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1433,6 +1472,7 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                memory_request_finished = true;
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1519,11 +1559,13 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
-        if (!is_resume) {
-            return init();
+        if (!is_resume && !init()) {
+            return false;
         }
 
-        if (callback_state) {
+        capture_memory("after_load", true);
+
+        if (is_resume && callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
 
@@ -1539,10 +1581,19 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
-            return process_single_task(std::move(task), is_yielding);
+            const bool refresh = !is_yielding && task.type != SERVER_TASK_TYPE_METRICS &&
+                task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_GET_LORA &&
+                task.type != SERVER_TASK_TYPE_NEXT_RESPONSE;
+            const bool handled = process_single_task(std::move(task), is_yielding);
+            if (refresh) {
+                capture_memory("after_reconfigure");
+            }
+            return handled;
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+            capture_memory(memory_request_finished ? "after_request" : "after_batch", memory_request_finished);
+            memory_request_finished = false;
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -3258,6 +3309,11 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+            // The callback captures the last batch. Publish intermediate prompt
+            // batches here without collecting twice for each generated token.
+            if (off_next < batch.size()) {
+                capture_memory("after_batch");
+            }
         }
     }
 
@@ -3912,6 +3968,7 @@ private:
                         queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
+                        capture_memory("after_projector");
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
@@ -4114,6 +4171,7 @@ private:
                 queue_tasks.yield_to_queue([&]() {
                     res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
                 });
+                capture_memory("after_projector");
                 embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
             }
 
@@ -4174,7 +4232,6 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
-
         if (ret != 0) {
             {
                 std::string err;
@@ -5175,6 +5232,20 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    this->get_tllama_memory = [this](const server_http_req &) {
+        auto res = create_response(true);
+        res->headers["Cache-Control"] = "no-store";
+        // This is the only context accessor allowed here: it reads an immutable
+        // snapshot and never touches native owners, even during sleep or decode.
+        auto snapshot = ctx_server.get_memory_report();
+        if (snapshot.is_null()) {
+            res->error(format_error_response("Memory snapshot is not available", ERROR_TYPE_UNAVAILABLE));
+        } else {
+            res->ok(snapshot);
+        }
         return res;
     };
 

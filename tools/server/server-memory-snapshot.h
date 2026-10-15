@@ -11,7 +11,8 @@ public:
     explicit server_memory_reporter(std::string fingerprint = {});
     void capture(const server_memory_sources & sources, const char * stage, bool force = true);
     void publish(json inventory, const char * model_state, const char * stage, bool force = true);
-    void transition(const char * model_state, const char * stage, bool known_empty = false);
+    void transition(const char * model_state, const char * stage, bool known_empty = false,
+                    const char * reason = "transition_in_progress");
     json read() const; // null until the first snapshot is published
 
 private:

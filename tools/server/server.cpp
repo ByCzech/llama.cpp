@@ -262,6 +262,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
+    if (!is_router_server) {
+        ctx_http.get("/tllama/memory", ex_wrapper(routes.get_tllama_memory));
+    }
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));

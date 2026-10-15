@@ -22,14 +22,14 @@ void server_memory_reporter::publish(json inventory, const char * model_state, c
     std::atomic_store_explicit(&current, std::move(next), std::memory_order_release);
 }
 
-void server_memory_reporter::transition(const char * model_state, const char * stage, bool known_empty) {
+void server_memory_reporter::transition(const char * model_state, const char * stage, bool known_empty, const char * reason) {
     // Invalidate cached buffer identities before any native object can be freed.
     native.reset();
     server_memory_collector empty;
     if (!known_empty) {
         const auto no_owner = std::numeric_limits<size_t>::max();
-        empty.missing(no_owner, "inventory", "transition_in_progress");
-        empty.missing(no_owner, "inventory", "transition_in_progress", true);
+        empty.missing(no_owner, "inventory", reason);
+        empty.missing(no_owner, "inventory", reason, true);
     }
     publish(empty.finish(), model_state, stage);
 }
