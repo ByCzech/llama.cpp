@@ -104,6 +104,42 @@ these properties. SYCL USM kinds also need no heap index. A Level Zero ordinal
 is not a Vulkan heap index. Future unsigned native properties can use new
 names without changing this ABI; other value types require a new ABI.
 
+## Vulkan exporter
+
+Vulkan exports this procedure for its ordinary device buffers, pinned host
+buffers and successful external-host imports. It saves type, heap, raw type/heap
+flags and native allocation size only after `allocateMemory()` succeeds. A
+failed candidate contributes no metadata. The existing retry order, requested
+sizes, mmap policy and allocation behavior stay unchanged.
+
+The identity domain is the live native Vulkan device object; allocation identity
+is the owned native buffer/allocation object. Device buffers use their existing
+private context. Pinned host buffers use their CPU pointer to look up the
+existing pinned map under its read lock, retaining the native allocation while
+copying metadata. No context cast from a CPU pointer, SDK query or device
+initialization is performed during inspection. Missing metadata or invalid
+ranges return `UNAVAILABLE` without publishing a binding.
+
+Pinned allocation fallback returns an actual CPU buffer, so inspection uses the
+CPU provider and publishes no metadata from a failed Vulkan attempt. Zero-size
+probes without native memory return `COMPLETE` with no allocations. Ordinary
+native spans include Vulkan-required padding, while ggml buffer capacity keeps
+its original meaning. Pinned subranges carry their proved allocation offsets.
+
+Imported host memory uses `origin=IMPORTED` and `kind=HOST`. Its metadata is
+available only if that native path succeeds; this exporter does not enable host
+imports where the device capabilities currently disable them. Separate imports
+can alias the same external memory and must not imply separate physical payloads.
+Device-local and host-visible flags remain independent for pinned, imported and
+device buffers alike. An iGPU does not discount bytes or change assignment.
+
+`test-memory-vulkan` exercises the same allocation-call wrapper and metadata
+translation without a Vulkan SDK/device. It injects a failed first candidate,
+verifies the successful second type/heap and tests import failure, pinned ranges,
+local/nonlocal flags, CPU fallback dispatch and empty results. Native pinned-map
+lookup, actual import/allocation and inference still require Vulkan hardware
+checks; the CPU fixture does not replace them.
+
 ## Buffer bindings
 
 `known_fields` independently marks `BUFFER_OFFSET`, `ALLOCATION_OFFSET`, and

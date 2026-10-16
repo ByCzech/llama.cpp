@@ -16190,8 +16190,54 @@ static uint32_t ggml_backend_vk_memory_buffer_flags(ggml_backend_buffer_t buffer
     return buffer->iface.free_buffer == ggml_backend_vk_host_buffer_free_buffer ? GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED : 0;
 }
 
+static ggml_backend_memory_allocation_status ggml_backend_vk_memory_allocations(
+        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user_data) {
+    const auto size = ggml_backend_buffer_get_size(buffer);
+    // Generic zero-size probes have a Vulkan type but no private context or VkDeviceMemory.
+    if (size == 0 && !buffer->context) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE;
+    }
+    vk_buffer native;
+    size_t offset = 0;
+    const bool pinned = buffer->iface.free_buffer == ggml_backend_vk_host_buffer_free_buffer;
+    if (pinned) {
+        if (!vk_instance.devices[0]) {
+            return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+        }
+        // Host contexts are CPU pointers. Read the existing pinned map without initializing a device.
+        try {
+            ggml_vk_host_get(vk_instance.devices[0], buffer->context, native, offset);
+        } catch (const std::system_error &) {
+            return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+        }
+    } else if (buffer->iface.free_buffer == ggml_backend_vk_buffer_free_buffer) {
+        const auto * ctx = static_cast<const ggml_backend_vk_buffer_context *>(buffer->context);
+        native = ctx ? ctx->dev_buffer : nullptr;
+    } else {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    if (!native) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    if (native->size == 0 && !native->device_memory) {
+        return size == 0 ? GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE : GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    if (offset > native->size || size > native->size - offset) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    auto * device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+    const auto * ctx = device ? static_cast<const ggml_backend_vk_device_context *>(device->context) : nullptr;
+    if (!native->device_memory || !native->device || !ctx || native->device->idx != size_t(ctx->device)) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    return ggml_vk_memory_visit(native->memory_allocation, native->device.get(), native.get(), device,
+        pinned, offset, size, callback, user_data);
+}
+
 static void * ggml_backend_vk_memory_proc(ggml_backend_reg_t, const char * name) {
-    return strcmp(name, "tllama_buffer_memory_flags") == 0 ? (void *) ggml_backend_vk_memory_buffer_flags : nullptr;
+    if (strcmp(name, "tllama_buffer_memory_flags") == 0) { return (void *) ggml_backend_vk_memory_buffer_flags; }
+    if (strcmp(name, "tllama_buffer_memory_allocations_v1") == 0) { return (void *) ggml_backend_vk_memory_allocations; }
+    return nullptr;
 }
 
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {

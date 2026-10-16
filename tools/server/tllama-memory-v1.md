@@ -152,11 +152,11 @@ type or buffer names.
 ## Tests
 
 With CPU, tools, server, tests and mtmd enabled, build `llama-server`,
-`test-memory-allocations`, `test-memory-buffers`, `test-memory-report`, and
+`test-memory-vulkan`, `test-memory-allocations`, `test-memory-buffers`, `test-memory-report`, and
 `test-memory-snapshot`, then run:
 
 ```sh
-ctest --test-dir build -R '^test-memory-(allocations|buffers|report|snapshot|http)$' --output-on-failure
+ctest --test-dir build -R '^test-memory-(vulkan|allocations|buffers|report|snapshot|http)$' --output-on-failure
 ```
 
 The HTTP test uses Python's standard library and a generated CPU GGUF model; it

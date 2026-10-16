@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-vulkan.h"
+#include "ggml-vulkan-memory.h"
 
 #include <vulkan/vulkan_core.h>
 
@@ -1058,6 +1059,7 @@ inline void vk_command_pool::destroy(vk::Device& device) {
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
+    ggml_vk_memory_allocation memory_allocation;
     vk::MemoryPropertyFlags memory_property_flags;
     void * ptr;
     size_t size = 0;

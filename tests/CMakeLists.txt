@@ -355,6 +355,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
 
+    add_executable(test-memory-vulkan test-memory-vulkan.cpp)
+    target_link_libraries(test-memory-vulkan PRIVATE ggml)
+    llama_test(test-memory-vulkan)
+
     add_executable(test-memory-allocations test-memory-allocations.cpp)
     target_link_libraries(test-memory-allocations PRIVATE ggml)
     llama_test(test-memory-allocations)

@@ -1,5 +1,7 @@
 #include "ggml-vulkan-common.h"
 
+static_assert(ggml_vk_memory_device_local_bit == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "Vulkan memory flag ABI changed");
+
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer        = */ ggml_backend_vk_buffer_type_alloc_buffer,
@@ -67,6 +69,12 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
 
+    const auto allocation_metadata = [&](uint64_t bytes, uint32_t type, bool imported) {
+        const auto & selected = mem_props.memoryTypes[type];
+        return ggml_vk_memory_allocation {type, selected.heapIndex, uint32_t(selected.propertyFlags),
+            uint32_t(mem_props.memoryHeaps[selected.heapIndex].flags), bytes, imported};
+    };
+
     const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
 
     vk::MemoryAllocateFlagsInfo mem_flags_info { mem_flags };
@@ -109,13 +117,16 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             return {};
         }
 
-        buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
         try {
             vk::ImportMemoryHostPointerInfoEXT import_info;
             import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
             import_info.pHostPointer = import_ptr;
             import_info.setPNext(&mem_flags_info);
-            buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
+            buf->device_memory = ggml_vk_allocate_memory_record(buf->memory_allocation,
+                allocation_metadata(size, memory_type_idx, true), [&] {
+                    return device->device.allocateMemory({ size, memory_type_idx, &import_info });
+                });
+            buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
         } catch (const vk::SystemError& e) {
         }
     } else {
@@ -132,7 +143,10 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
                 try {
-                    buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
+                    buf->device_memory = ggml_vk_allocate_memory_record(buf->memory_allocation,
+                        allocation_metadata(mem_req.size, *mtype_it, false), [&] {
+                            return device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
+                        });
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
                     done = true;
                     break;
