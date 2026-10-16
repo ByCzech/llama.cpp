@@ -152,10 +152,11 @@ type or buffer names.
 ## Tests
 
 With CPU, tools, server, tests and mtmd enabled, build `llama-server`,
-`test-memory-buffers`, `test-memory-report`, and `test-memory-snapshot`, then run:
+`test-memory-allocations`, `test-memory-buffers`, `test-memory-report`, and
+`test-memory-snapshot`, then run:
 
 ```sh
-ctest --test-dir build -R '^test-memory-(buffers|report|snapshot|http)$' --output-on-failure
+ctest --test-dir build -R '^test-memory-(allocations|buffers|report|snapshot|http)$' --output-on-failure
 ```
 
 The HTTP test uses Python's standard library and a generated CPU GGUF model; it
@@ -167,3 +168,8 @@ A CPU-backed test provider exercises the real loader's host assignment, partial
 offload, overrides, fallback, mmap and tied-weight paths through JSON collection;
 a 40-layer fixture checks the 0-20 CPU / 21-39 GPU boundary and GPU output.
 Actual GPU inference and vision/projector runs require separate hardware checks.
+
+The optional native allocation accessor is specified in
+[the native ABI contract](../../docs/development/tllama-memory-allocations.md).
+Its metadata/coverage fixtures need no GPU SDK or hardware. The accessor alone
+does not add allocation locality to this HTTP schema.

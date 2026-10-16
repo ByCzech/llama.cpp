@@ -2666,3 +2666,21 @@ uint32_t ggml_backend_memory_buffer_flags(ggml_backend_buffer_t buffer) {
     // Old split backends cannot prove that their objects are leaf allocations.
     return ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type") ? GGML_BACKEND_MEMORY_BUFFER_OPAQUE : 0;
 }
+
+ggml_backend_memory_allocation_status ggml_backend_memory_buffer_allocations(
+        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user_data) {
+    if (!buffer || !callback) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    // A multi-buffer uses its first child's type but has a different context layout.
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    auto * device = ggml_backend_memory_buffer_device(buffer);
+    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    if (!reg) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    auto inspect = (ggml_backend_memory_buffer_allocations_t) ggml_backend_reg_get_proc_address(reg, "tllama_buffer_memory_allocations_v1");
+    return inspect ? inspect(buffer, callback, user_data) : GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+}
