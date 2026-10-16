@@ -14,7 +14,8 @@ static void test_lifecycle() {
     auto inventory = empty.finish();
     reporter.publish(inventory, "loaded", "after_load");
     auto first = reporter.read();
-    GGML_ASSERT(first.size() == 14);
+    GGML_ASSERT(first.size() == 15);
+    GGML_ASSERT(first["allocation_locality"]["status"] == "known");
     GGML_ASSERT(first["schema_version"].get<int>() == 1);
     GGML_ASSERT(first["runtime_fingerprint"] == llama_build_info());
     GGML_ASSERT(first["scope"] == "backend_buffers");
@@ -41,6 +42,8 @@ static void test_lifecycle() {
     GGML_ASSERT(sleeping["status"] == "known");
     GGML_ASSERT(sleeping["model_state"] == "sleeping");
     GGML_ASSERT(sleeping["buffers"].empty());
+    GGML_ASSERT(sleeping["allocation_locality"]["status"] == "known");
+    GGML_ASSERT(sleeping["allocation_locality"]["allocations"].empty());
     GGML_ASSERT(sleeping["snapshot_sequence"].get<uint64_t>() == 4);
     const auto age = sleeping["snapshot_age_ms"].get<uint64_t>();
     GGML_ASSERT(reporter.read()["snapshot_age_ms"].get<uint64_t>() >= age);
@@ -63,6 +66,7 @@ static void test_concurrent_reads() {
         server_memory_collector empty;
         auto inventory = empty.finish();
         inventory["buffers"].push_back({{"id", "b1"}, {"size_bytes", uint64_t(1)}});
+        inventory["allocation_locality"]["allocations"].push_back({{"id", "a1"}, {"size_bytes", uint64_t(1)}});
         reporter.publish(inventory, "loaded", "after_load");
         {
             std::unique_lock<std::mutex> lock(mutex);
@@ -73,6 +77,7 @@ static void test_concurrent_reads() {
         }
         for (uint64_t i = 2; i <= 200; ++i) {
             inventory["buffers"][0]["size_bytes"] = i;
+            inventory["allocation_locality"]["allocations"][0]["size_bytes"] = i;
             reporter.publish(inventory, "loaded", "after_batch", false);
         }
         finished.store(true);
@@ -93,6 +98,7 @@ static void test_concurrent_reads() {
         const auto sequence = report["snapshot_sequence"].get<uint64_t>();
         GGML_ASSERT(sequence >= previous);
         GGML_ASSERT(sequence == report["buffers"][0]["size_bytes"].get<uint64_t>());
+        GGML_ASSERT(sequence == report["allocation_locality"]["allocations"][0]["size_bytes"].get<uint64_t>());
         GGML_ASSERT(report["runtime_fingerprint"] == "b-test");
         previous = sequence;
     } while (!finished.load());
@@ -100,8 +106,34 @@ static void test_concurrent_reads() {
     GGML_ASSERT(reporter.read()["snapshot_sequence"].get<uint64_t>() == 200);
 }
 
+static void test_locality_only_updates() {
+    server_memory_reporter reporter("test-locality");
+    server_memory_collector empty;
+    auto inventory = empty.finish();
+    inventory["allocation_locality"]["allocations"].push_back({{"id", "a1"}, {"size_bytes", 4096}});
+    reporter.publish(inventory, "loaded", "after_load");
+    auto saved = reporter.read();
+    reporter.publish(inventory, "loaded", "after_batch", false);
+    GGML_ASSERT(reporter.read()["snapshot_sequence"] == 1);
+    inventory["allocation_locality"]["allocations"][0]["size_bytes"] = 8192;
+    reporter.publish(inventory, "loaded", "after_batch", false);
+    GGML_ASSERT(reporter.read()["snapshot_sequence"] == 2);
+    GGML_ASSERT(saved["allocation_locality"]["allocations"][0]["size_bytes"] == 4096);
+    saved["allocation_locality"]["allocations"].clear();
+    GGML_ASSERT(reporter.read()["allocation_locality"]["allocations"][0]["size_bytes"] == 8192);
+    reporter.transition("unloading", "before_unload");
+    GGML_ASSERT(reporter.read()["allocation_locality"]["status"] == "unavailable");
+    reporter.transition("sleeping", "after_unload", true);
+    GGML_ASSERT(reporter.read()["allocation_locality"]["allocations"].empty());
+    GGML_ASSERT(reporter.read()["allocation_locality"]["bindings"].empty());
+    GGML_ASSERT(reporter.read()["allocation_locality"]["status"] == "known");
+    reporter.publish(inventory, "loaded", "after_load");
+    GGML_ASSERT(reporter.read()["snapshot_sequence"] == 5);
+}
+
 int main() {
     test_lifecycle();
     test_concurrent_reads();
+    test_locality_only_updates();
     std::puts("memory snapshots PASSED");
 }

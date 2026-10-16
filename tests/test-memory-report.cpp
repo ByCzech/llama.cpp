@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <stdexcept>
 
 // Device metadata fixtures do not emulate allocation or inference. Sizes are read
 // through the same native buffer API as real CPU allocations below.
@@ -16,6 +17,16 @@ struct fixture {
     uint32_t flags;
     bool host;
     bool legacy_split = false;
+    bool allocation_metadata = false, throw_allocation = false, fail_name_once = false;
+    size_t allocation_probes = 0;
+    int domain = 0, token = 0;
+    ggml_backend_memory_allocation_status allocation_status = GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE;
+    struct allocation_record {
+        ggml_backend_memory_allocation allocation;
+        ggml_backend_memory_binding binding;
+        std::vector<ggml_backend_memory_allocation_property> properties;
+    };
+    std::vector<allocation_record> records;
 
     fixture(enum ggml_backend_dev_type kind, bool host = false, uint32_t flags = 0) : kind(kind), flags(flags), host(host) {
         reg.api_version = GGML_BACKEND_API_VERSION;
@@ -23,6 +34,22 @@ struct fixture {
         reg.iface.get_name = [](ggml_backend_reg_t) { return "Fixture"; };
         reg.iface.get_proc_address = [](ggml_backend_reg_t r, const char * name) -> void * {
             auto * self = static_cast<fixture *>(r->context);
+            if (std::strcmp(name, "tllama_buffer_memory_allocations_v1") == 0 && self->allocation_metadata) {
+                static ggml_backend_memory_buffer_allocations_t inspect = [](
+                        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user) {
+                    auto & self = *static_cast<fixture *>(buffer->context);
+                    ++self.allocation_probes;
+                    if (self.throw_allocation) { throw std::runtime_error("fixture metadata failure"); }
+                    for (const auto & record : self.records) {
+                        auto allocation = record.allocation;
+                        allocation.properties = record.properties.data();
+                        allocation.property_count = record.properties.size();
+                        callback(&allocation, &record.binding, user);
+                    }
+                    return self.allocation_status;
+                };
+                return reinterpret_cast<void *>(inspect);
+            }
             if (self->legacy_split) {
                 return std::strcmp(name, "ggml_backend_split_buffer_type") == 0 ? r->context : nullptr;
             }
@@ -34,7 +61,11 @@ struct fixture {
         };
         dev.reg = &reg;
         dev.context = this;
-        dev.iface.get_name = [](ggml_backend_dev_t) { return "same-name"; };
+        dev.iface.get_name = [](ggml_backend_dev_t dev) {
+            auto & self = *static_cast<fixture *>(dev->context);
+            if (self.fail_name_once) { self.fail_name_once = false; throw std::runtime_error("fixture device failure"); }
+            return "same-name";
+        };
         dev.iface.get_type = [](ggml_backend_dev_t d) { return static_cast<fixture *>(d->context)->kind; };
         type.device = &dev;
         type.context = this;
@@ -43,6 +74,18 @@ struct fixture {
         buf.buft = &type;
         buf.context = this;
         buf.size = 4096;
+        ggml_backend_memory_allocation allocation = {};
+        allocation.identity_domain = &domain;
+        allocation.identity = &token;
+        allocation.device = &dev;
+        allocation.kind = GGML_BACKEND_MEMORY_ALLOCATION_KIND_DEVICE;
+        allocation.origin = GGML_BACKEND_MEMORY_ALLOCATION_ORIGIN_ALLOCATED;
+        allocation.locality = GGML_BACKEND_MEMORY_ALLOCATION_LOCALITY_DEVICE_LOCAL;
+        allocation.native_api = "vkAllocateMemory";
+        allocation.size_known = true;
+        allocation.size_bytes = 8192;
+        records.push_back({allocation, {7, 0, 0, 4096}, {{"vulkan.memory_type_index", 0},
+            {"vulkan.heap_index", 0}, {"vulkan.memory_property_flags", 3}, {"vulkan.heap_flags", 1}}});
     }
 };
 
@@ -217,11 +260,156 @@ static void test_partial_and_unknown() {
     GGML_ASSERT(result["missing_components"][0]["owner_id"].is_null());
 }
 
+static void test_locality_aliases() {
+    json saved;
+    {
+        fixture first(GGML_BACKEND_DEVICE_TYPE_GPU), second(GGML_BACKEND_DEVICE_TYPE_GPU);
+        first.allocation_metadata = second.allocation_metadata = true;
+        first.records[0].properties.push_back({"unsafe.handle", uint64_t(reinterpret_cast<uintptr_t>(&first.token))});
+        second.records = first.records; // two providers/buffers, one proved allocation and association
+        server_memory_collector collector;
+        const auto main = collector.owner(&first, "model", "main");
+        const auto draft = collector.owner(&second, "model", "draft");
+        collector.buffer(main, view(&first.buf));
+        collector.buffer(draft, view(&second.buf));
+        collector.buffer(draft, view(&first.buf));
+        collector.placement(main, {LLAMA_MEMORY_MODEL_PART_REPEATING, 0, &first.buf, true});
+        collector.placement(draft, {LLAMA_MEMORY_MODEL_PART_REPEATING, 0, &second.buf, true});
+        saved = collector.finish();
+        const auto & locality = saved["allocation_locality"];
+        GGML_ASSERT(saved["status"] == "known" && saved["placement"]["status"] == "known");
+        GGML_ASSERT(total(saved) == 8192 && saved["buffers"].size() == 2);
+        GGML_ASSERT(locality["status"] == "known" && locality["allocations"].size() == 1 && locality["bindings"].size() == 2);
+        GGML_ASSERT(locality["allocations"][0]["size_bytes"] == 8192);
+        GGML_ASSERT(locality["allocations"][0]["device_ids"] == json::array({"d1"}));
+        GGML_ASSERT(saved["buffers"][1]["device_ids"] == json::array({"d2"}));
+        GGML_ASSERT(locality["allocations"][0]["native_properties"]["vulkan.heap_index"] == 0);
+        GGML_ASSERT(locality["bindings"][0]["allocation_id"] == locality["bindings"][1]["allocation_id"]);
+        GGML_ASSERT(locality["bindings"][0]["size_bytes"] == 4096);
+        GGML_ASSERT(first.allocation_probes == 1 && second.allocation_probes == 1);
+        GGML_ASSERT(saved.dump().find("unsafe.handle") == std::string::npos);
+        GGML_ASSERT(saved.dump().find(std::to_string(reinterpret_cast<uintptr_t>(&first.token))) == std::string::npos);
+    }
+    GGML_ASSERT(saved["allocation_locality"]["physical_aliasing"] == "unknown");
+    GGML_ASSERT(saved["allocation_locality"]["allocations"][0]["native_api"] == "vkAllocateMemory");
+}
+
+static void test_locality_coverage() {
+    fixture first(GGML_BACKEND_DEVICE_TYPE_GPU), second(GGML_BACKEND_DEVICE_TYPE_GPU);
+    first.allocation_metadata = second.allocation_metadata = true;
+    second.records[0].allocation.identity = first.records[0].allocation.identity; // different domains, equal token/heap/name
+    second.allocation_status = GGML_BACKEND_MEMORY_ALLOCATION_PARTIAL;
+    server_memory_collector collector;
+    const auto owner = collector.owner(&collector, "model", "main");
+    collector.buffer(owner, view(&first.buf));
+    collector.buffer(owner, view(&second.buf));
+    const auto report = collector.finish();
+    GGML_ASSERT(report["status"] == "known" && total(report) == 8192);
+    GGML_ASSERT(report["allocation_locality"]["status"] == "partial");
+    GGML_ASSERT(report["allocation_locality"]["allocations"].size() == 2);
+    GGML_ASSERT(report["allocation_locality"]["missing_components"][0]["reason"] == "incomplete_allocation_metadata");
+
+    fixture opaque(GGML_BACKEND_DEVICE_TYPE_GPU, false, GGML_BACKEND_MEMORY_BUFFER_OPAQUE);
+    opaque.allocation_metadata = true;
+    server_memory_collector independent;
+    const auto other = independent.owner(&opaque, "model", "main");
+    independent.buffer(other, view(&opaque.buf));
+    const auto separate = independent.finish();
+    GGML_ASSERT(separate["status"] == "unavailable" && separate["buffers"][0]["size_bytes"].is_null());
+    GGML_ASSERT(separate["allocation_locality"]["status"] == "known");
+
+    fixture unknown(GGML_BACKEND_DEVICE_TYPE_GPU);
+    unknown.allocation_metadata = true;
+    auto & allocation = unknown.records[0].allocation;
+    allocation.device = nullptr;
+    allocation.kind = GGML_BACKEND_MEMORY_ALLOCATION_KIND_MANAGED;
+    allocation.locality = GGML_BACKEND_MEMORY_ALLOCATION_LOCALITY_UNKNOWN;
+    allocation.native_api = "cudaMallocManaged";
+    allocation.size_known = false;
+    unknown.records[0].properties.clear();
+    unknown.records[0].binding = {0, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    server_memory_collector managed;
+    managed.buffer(managed.owner(&unknown, "model", "main"), view(&unknown.buf));
+    const auto result = managed.finish()["allocation_locality"];
+    GGML_ASSERT(result["status"] == "known");
+    GGML_ASSERT(result["allocations"][0]["kind"] == "managed" && result["allocations"][0]["device_ids"].empty());
+    GGML_ASSERT(result["allocations"][0]["size_bytes"].is_null() && result["allocations"][0]["native_properties"].empty());
+    GGML_ASSERT(result["bindings"][0]["buffer_offset_bytes"].is_null() && result["bindings"][0]["size_bytes"].is_null());
+}
+
+static void test_locality_failures() {
+    for (int scenario = 0; scenario < 6; ++scenario) {
+        fixture source(GGML_BACKEND_DEVICE_TYPE_GPU);
+        source.allocation_metadata = scenario != 0;
+        source.throw_allocation = scenario == 1;
+        if (scenario == 2) { source.allocation_status = GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE; }
+        if (scenario == 3) { source.records[0].allocation.identity = nullptr; }
+        if (scenario == 4) { source.records[0].properties.push_back(source.records[0].properties.front()); }
+        if (scenario == 5) { source.allocation_status = GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED; }
+        server_memory_collector collector;
+        const auto owner = collector.owner(&source, "model", "main");
+        collector.buffer(owner, view(&source.buf));
+        collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 0, &source.buf, true});
+        const auto result = collector.finish();
+        GGML_ASSERT(result["status"] == "known" && result["placement"]["status"] == "known" && total(result) == 4096);
+        GGML_ASSERT(result["allocation_locality"]["status"] == "unavailable");
+        GGML_ASSERT(result["allocation_locality"]["allocations"].empty() && result["allocation_locality"]["bindings"].empty());
+    }
+    // Failed allocation-only device metadata must not poison the common provider catalog.
+    fixture associated(GGML_BACKEND_DEVICE_TYPE_GPU), provider(GGML_BACKEND_DEVICE_TYPE_GPU);
+    associated.allocation_metadata = provider.allocation_metadata = true;
+    associated.records[0].allocation.device = &provider.dev;
+    provider.fail_name_once = true;
+    server_memory_collector catalog;
+    const auto catalog_owner = catalog.owner(&catalog, "model", "main");
+    catalog.buffer(catalog_owner, view(&associated.buf));
+    catalog.buffer(catalog_owner, view(&provider.buf));
+    const auto stable = catalog.finish();
+    GGML_ASSERT(stable["status"] == "known" && total(stable) == 8192);
+    GGML_ASSERT(stable["devices"].size() == 2 && stable["devices"][1]["id"] == "d2");
+    GGML_ASSERT(stable["buffers"][1]["device_ids"] == json::array({"d2"}));
+    GGML_ASSERT(stable["allocation_locality"]["status"] == "partial");
+
+    fixture valid(GGML_BACKEND_DEVICE_TYPE_GPU);
+    valid.allocation_metadata = true;
+    auto invalid = valid.records[0];
+    invalid.binding.allocation_offset = UINT64_MAX;
+    invalid.binding.size_bytes = 2;
+    valid.records.push_back(invalid);
+    server_memory_collector partial;
+    partial.buffer(partial.owner(&valid, "model", "main"), view(&valid.buf));
+    const auto subset = partial.finish()["allocation_locality"];
+    GGML_ASSERT(subset["status"] == "partial" && subset["bindings"].size() == 1);
+    GGML_ASSERT(subset["missing_components"][0]["reason"] == "invalid_metadata");
+
+    fixture conflict(GGML_BACKEND_DEVICE_TYPE_GPU);
+    conflict.allocation_metadata = true;
+    server_memory_collector collector;
+    const auto owner = collector.owner(&valid, "model", "main");
+    collector.buffer(owner, view(&valid.buf));
+    conflict.records = {valid.records[0]};
+    conflict.records[0].allocation.size_bytes++;
+    collector.buffer(owner, view(&conflict.buf));
+    const auto inconsistent = collector.finish()["allocation_locality"];
+    GGML_ASSERT(inconsistent["status"] == "unavailable" && inconsistent["allocations"].empty() && inconsistent["bindings"].empty());
+    size_t conflicts = 0;
+    for (const auto & missing : inconsistent["missing_components"]) { conflicts += missing["reason"] == "conflicting_allocation_metadata"; }
+    GGML_ASSERT(conflicts == 2);
+
+    server_memory_collector empty;
+    GGML_ASSERT(empty.finish()["allocation_locality"]["status"] == "known");
+    empty.missing(empty.owner(&empty, "model", "main"), "inventory", "transition_in_progress");
+    GGML_ASSERT(empty.finish()["allocation_locality"]["status"] == "unavailable");
+}
+
 int main() {
     ggml_backend_load_all();
     test_deduplication();
     test_device_classification();
     test_assignment_evidence();
     test_partial_and_unknown();
+    test_locality_aliases();
+    test_locality_coverage();
+    test_locality_failures();
     std::puts("memory report PASSED");
 }

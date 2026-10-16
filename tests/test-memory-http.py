@@ -96,7 +96,7 @@ def worker(*args):
 def validate(report):
     assert set(report) == {"schema_version", "runtime_fingerprint", "scope", "precision",
                            "status", "missing_components", "model_state", "snapshot_sequence",
-                           "snapshot_stage", "snapshot_age_ms", "owners", "devices", "buffers", "placement"}
+                           "snapshot_stage", "snapshot_age_ms", "owners", "devices", "buffers", "placement", "allocation_locality"}
     assert type(report["schema_version"]) is int and report["schema_version"] == 1
     assert report["scope"] == "backend_buffers" and report["precision"] == "exact_bytes"
     assert report["runtime_fingerprint"].startswith("b")
@@ -131,6 +131,27 @@ def validate(report):
                                                "loader_lazy", "native_buffer"}
             assert evidence["status"] != "known" or not evidence["reasons"]
 
+    locality = report["allocation_locality"]
+    assert set(locality) == {"status", "scope", "physical_aliasing", "missing_components", "allocations", "bindings"}
+    assert locality["status"] in ("known", "partial", "unavailable")
+    assert locality["scope"] == "backend_buffer_allocations" and locality["physical_aliasing"] == "unknown"
+    allocations = {item["id"] for item in locality["allocations"]}
+    assert len(allocations) == len(locality["allocations"])
+    for item in locality["allocations"]:
+        assert set(item) == {"id", "device_ids", "kind", "origin", "native_api", "size_bytes", "locality", "native_properties"}
+        assert set(item["device_ids"]) <= devices
+        assert item["kind"] in ("unknown", "device", "host", "host_pinned", "managed", "shared", "system")
+        assert item["origin"] in ("unknown", "allocated", "imported", "registered")
+        assert item["locality"] in ("unknown", "device_local", "non_device_local")
+        assert item["size_bytes"] is None or (type(item["size_bytes"]) is int and item["size_bytes"] >= 0)
+    for item in locality["bindings"]:
+        assert set(item) == {"buffer_id", "allocation_id", "buffer_offset_bytes", "allocation_offset_bytes", "size_bytes"}
+        assert item["buffer_id"] in buffers and item["allocation_id"] in allocations
+        assert all(item[key] is None or (type(item[key]) is int and item[key] >= 0)
+                   for key in ("buffer_offset_bytes", "allocation_offset_bytes", "size_bytes"))
+    for item in locality["missing_components"]:
+        assert item["buffer_id"] is None or item["buffer_id"] in buffers
+
 
 def test_loaded_auth_and_stream(server, model, directory, mmap):
     options = ["--load-mode", "mmap" if mmap else "none"]
@@ -148,6 +169,8 @@ def test_loaded_auth_and_stream(server, model, directory, mmap):
             assert group["assignment"]["status"] == "known"
             assert group["assignment"]["device_ids"] and set(group["assignment"]["device_ids"]) <= cpu_devices
             assert group["assignment"]["sources"] == ["loader_selection"]
+        assert initial["allocation_locality"]["status"] == "unavailable"  # CPU exporter is optional
+        assert initial["allocation_locality"]["allocations"] == []
         assert all(item["memory_kind"] == "host" for item in initial["buffers"])
         weights = [item for item in initial["buffers"] if any(
             owner["component"] == "model_weights" for owner in item["owners"])]
@@ -192,6 +215,8 @@ def test_sleep(server, model, directory):
             return report if report["model_state"] == "sleeping" else None
         saved = instance.wait(asleep)
         assert saved["status"] == "known" and saved["buffers"] == []
+        assert saved["allocation_locality"]["status"] == "known"
+        assert saved["allocation_locality"]["allocations"] == saved["allocation_locality"]["bindings"] == []
         assert saved["snapshot_stage"] == "after_unload"
         assert saved["snapshot_sequence"] > before["snapshot_sequence"]
         assert instance.report()["snapshot_sequence"] == saved["snapshot_sequence"]

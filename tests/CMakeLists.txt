@@ -370,6 +370,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
         find_package(Threads REQUIRED)
         add_library(test-memory-report-support STATIC
             ../tools/server/server-memory.cpp
+            ../tools/server/server-memory-locality.cpp
             ../tools/server/server-memory-snapshot.cpp
             ../common/json.cpp)
         target_link_libraries(test-memory-report-support PUBLIC llama mtmd llama-common-base vendor::nlohmann)

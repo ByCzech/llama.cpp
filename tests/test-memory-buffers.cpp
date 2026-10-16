@@ -10,6 +10,7 @@
 #include "gguf.h"
 #ifdef TLLAMA_TEST_MEMORY_REPORT
 #include "../tools/server/server-memory.h"
+#include "../tools/server/server-memory-snapshot.h"
 #endif
 
 #include <cstdio>
@@ -456,6 +457,87 @@ static llama_context_ptr context(llama_model * model, bool embeddings = false) {
     return ctx;
 }
 
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+// Metadata-only registry fixture over real CPU models/contexts. Restore the process-local registry on exit.
+struct cpu_allocation_fixture {
+    static cpu_allocation_fixture * active;
+    ggml_backend_reg_t reg;
+    void * (*original)(ggml_backend_reg_t, const char *);
+    int generation = 1;
+
+    cpu_allocation_fixture() {
+        GGML_ASSERT(!active);
+        reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        original = reg->iface.get_proc_address;
+        active = this;
+        reg->iface.get_proc_address = [](ggml_backend_reg_t reg, const char * name) -> void * {
+            if (std::strcmp(name, "tllama_buffer_memory_allocations_v1") != 0) {
+                return active->original ? active->original(reg, name) : nullptr;
+            }
+            static ggml_backend_memory_buffer_allocations_t inspect = [](
+                    ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user) {
+                ggml_backend_memory_allocation allocation = {};
+                allocation.identity_domain = active;
+                allocation.identity = buffer;
+                allocation.device = ggml_backend_memory_buffer_device(buffer);
+                allocation.kind = GGML_BACKEND_MEMORY_ALLOCATION_KIND_HOST;
+                allocation.origin = GGML_BACKEND_MEMORY_ALLOCATION_ORIGIN_ALLOCATED;
+                allocation.native_api = active->generation == 1 ? "fixture-generation-1" : "fixture-generation-2";
+                allocation.size_known = true;
+                allocation.size_bytes = ggml_backend_buffer_get_size(buffer);
+                const ggml_backend_memory_binding binding = {7, 0, 0, allocation.size_bytes};
+                callback(&allocation, &binding, user);
+                return GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE;
+            };
+            return reinterpret_cast<void *>(inspect);
+        };
+    }
+    ~cpu_allocation_fixture() { reg->iface.get_proc_address = original; active = nullptr; }
+};
+cpu_allocation_fixture * cpu_allocation_fixture::active = nullptr;
+
+static void test_locality_native_lifecycle() {
+    cpu_allocation_fixture fixture;
+    server_memory_reporter reporter("fixture-locality");
+    for (int generation = 1; generation <= 2; ++generation) {
+        fixture.generation = generation;
+        auto data = metadata("llama");
+        std::set<ggml_backend_buffer_t> initialized;
+        llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, model_params()));
+        GGML_ASSERT(model);
+        auto ctx = context(model.get());
+        reporter.capture({ctx.get()}, "after_load");
+        const auto first = reporter.read();
+        GGML_ASSERT(first["allocation_locality"]["status"] == "known");
+        GGML_ASSERT(!first["allocation_locality"]["allocations"].empty());
+        for (const auto & allocation : first["allocation_locality"]["allocations"]) {
+            GGML_ASSERT(allocation["native_api"] == (generation == 1 ? "fixture-generation-1" : "fixture-generation-2"));
+        }
+        reporter.capture({ctx.get()}, "after_batch", false);
+        GGML_ASSERT(reporter.read()["snapshot_sequence"] == first["snapshot_sequence"]);
+        if (generation == 1) {
+            fixture.generation = 2;
+            reporter.capture({ctx.get()}, "after_batch", false);
+            const auto refreshed = reporter.read();
+            GGML_ASSERT(refreshed["buffers"] == first["buffers"]);
+            GGML_ASSERT(refreshed["snapshot_sequence"].get<uint64_t>() > first["snapshot_sequence"].get<uint64_t>());
+            bool cached_weights = false, fresh_context = false;
+            for (const auto & allocation : refreshed["allocation_locality"]["allocations"]) {
+                cached_weights |= allocation["native_api"] == "fixture-generation-1";
+                fresh_context |= allocation["native_api"] == "fixture-generation-2";
+            }
+            GGML_ASSERT(cached_weights && fresh_context);
+        }
+        reporter.transition("unloading", "before_unload");
+        ctx.reset();
+        model.reset();
+        reporter.transition("sleeping", "after_unload", true);
+        const auto empty = reporter.read()["allocation_locality"];
+        GGML_ASSERT(empty["status"] == "known" && empty["allocations"].empty() && empty["bindings"].empty());
+    }
+}
+#endif
+
 static void check_native_sizes(const llama_context * ctx, const inventory & weights, const inventory & state) {
     struct sizes { size_t model = 0, context = 0, compute = 0; };
     std::map<ggml_backend_buffer_type_t, sizes> actual;
@@ -750,6 +832,7 @@ int main(int argc, char ** argv) {
     test_missing_placement();
 #ifdef TLLAMA_TEST_MEMORY_REPORT
     test_partial_assignment_report();
+    test_locality_native_lifecycle();
 #endif
     {
         auto data = metadata("qwen35");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "json.h"
+#include "server-memory-locality.h"
 #include "../../src/llama-memory-placement.h"
 
 #include <map>
@@ -43,6 +44,7 @@ private:
         bool unknown = false;
     };
     json data;
+    server_memory_locality locality;
     bool usable = false;
     bool placement_usable = false;
     std::map<std::string, std::map<const void *, size_t>> owner_indices;

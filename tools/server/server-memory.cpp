@@ -108,12 +108,18 @@ json server_memory_collector::device(ggml_backend_dev_t native) {
         index = found->second;
     } else {
         index = data["devices"].size();
-        device_indices.emplace(native, index);
         auto * reg = ggml_backend_dev_backend_reg(native);
         const auto * name = ggml_backend_dev_name(native);
         const auto * backend = reg ? ggml_backend_reg_name(reg) : nullptr;
-        data["devices"].push_back({{"id", "d" + std::to_string(index + 1)},
-            {"backend", backend ? json(backend) : json()}, {"name", name ? json(name) : json()}, {"type", device_type(native)}});
+        json item = {{"id", "d" + std::to_string(index + 1)},
+            {"backend", backend ? json(backend) : json()}, {"name", name ? json(name) : json()}, {"type", device_type(native)}};
+        data["devices"].push_back(std::move(item));
+        try {
+            device_indices.emplace(native, index);
+        } catch (const std::exception &) {
+            data["devices"].erase(index);
+            throw;
+        }
     }
     return json::array({data["devices"][index]["id"]});
 }
@@ -122,6 +128,7 @@ void server_memory_collector::missing(size_t owner_index, const char * component
     json id = owner_index == no_owner ? json() : data["owners"][owner_index]["id"];
     auto & entries = placement ? data["placement"]["missing_components"] : data["missing_components"];
     append_unique(entries, {{"owner_id", id}, {"component", component}, {"reason", reason}});
+    if (!placement) { locality.missing("", reason); }
 }
 
 void server_memory_collector::known_source() {
@@ -162,11 +169,17 @@ void server_memory_collector::buffer(size_t owner_index, const llama_memory_buff
             {"device_ids", device(native)}, {"buffer_type", name ? json(name) : json()},
             {"memory_kind", kind}, {"backing", "unknown"},
             {"size_bytes", opaque ? json() : json(uint64_t(ggml_backend_buffer_get_size(view.buffer)))}});
+        try {
+            locality.buffer(view.buffer, data["buffers"][index], [&](ggml_backend_dev_t native) { return device(native); });
+        } catch (const std::exception &) {
+            locality.missing(data["buffers"][index]["id"].get<std::string>(), "collection_failed");
+        }
     }
     auto & item = data["buffers"][index];
     append_unique(item["owners"], {{"owner_id", data["owners"][owner_index]["id"]}, {"component", component_name(view.component)}});
     if (item["size_bytes"].is_null()) {
-        missing(owner_index, component_name(view.component), "opaque_composite");
+        append_unique(data["missing_components"], {{"owner_id", data["owners"][owner_index]["id"]},
+            {"component", component_name(view.component)}, {"reason", "opaque_composite"}});
     }
     if (view.backing != LLAMA_MEMORY_BACKING_UNKNOWN) {
         backings[index].insert(view.backing);
@@ -230,6 +243,7 @@ void server_memory_collector::placement(size_t owner_index, const llama_memory_p
 
 json server_memory_collector::finish() const {
     json result = data;
+    result["allocation_locality"] = locality.finish();
     result["status"] = data["missing_components"].empty() ? "known" : usable ? "partial" : "unavailable";
     auto & placement = result["placement"];
     placement["status"] = placement["missing_components"].empty() ? "known" : placement_usable ? "partial" : "unavailable";
