@@ -16,10 +16,26 @@ enum llama_memory_model_part {
     LLAMA_MEMORY_MODEL_PART_OTHER,
 };
 
+enum llama_memory_assignment_source {
+    LLAMA_MEMORY_ASSIGNMENT_UNKNOWN,
+    LLAMA_MEMORY_ASSIGNMENT_SELECTION,
+    LLAMA_MEMORY_ASSIGNMENT_OVERRIDE,
+    LLAMA_MEMORY_ASSIGNMENT_MMAP,
+    LLAMA_MEMORY_ASSIGNMENT_LAZY,
+};
+
+struct llama_memory_tensor_assignment {
+    ggml_backend_dev_t device = nullptr;
+    ggml_backend_dev_t selection_device = nullptr; // supports_op candidate, not necessarily the assigned device
+    ggml_backend_buffer_type_t buffer_type = nullptr; // final loader choice, checked against the actual allocation on visit
+    llama_memory_assignment_source source = LLAMA_MEMORY_ASSIGNMENT_UNKNOWN;
+};
+
 struct llama_memory_tensor_role {
     const ggml_tensor * tensor;
     llama_memory_model_part part;
     int32_t layer;
+    llama_memory_tensor_assignment assignment = {};
 };
 
 struct llama_memory_placement_view {
@@ -27,6 +43,7 @@ struct llama_memory_placement_view {
     int32_t layer; // native block index, or -1 for non-layer weights
     ggml_backend_buffer_t buffer; // borrowed; NULL if no buffer is known
     bool known; // both the role and the actual buffer are known
+    llama_memory_tensor_assignment assignment = {}; // device is NULL when the final assignment cannot be proved
 };
 
 using llama_memory_placement_visitor = std::function<void(const llama_memory_placement_view &)>;
@@ -42,7 +59,8 @@ inline ggml_backend_buffer_t llama_memory_tensor_buffer(const ggml_tensor * tens
 
 void llama_memory_record_tensor_role(
         std::vector<llama_memory_tensor_role> & roles, const ggml_tensor * tensor,
-        const LLM_TN_IMPL & name, bool duplicated, int32_t n_layer, int32_t n_layer_all);
+        const LLM_TN_IMPL & name, bool duplicated, int32_t n_layer, int32_t n_layer_all,
+        const llama_memory_tensor_assignment & assignment = {});
 
 bool llama_memory_visit_tensor_roles(
         const std::vector<llama_memory_tensor_role> & roles,

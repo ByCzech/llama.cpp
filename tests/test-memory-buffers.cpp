@@ -5,6 +5,8 @@
 #include "../src/llama-memory-placement.h"
 #include "../src/llama-adapter.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "gguf.h"
 #ifdef TLLAMA_TEST_MEMORY_REPORT
 #include "../tools/server/server-memory.h"
@@ -138,6 +140,181 @@ static llama_model_params model_params() {
     return params;
 }
 
+// A loader-only provider: CPU-backed storage, no GPU execution or hardware claims.
+// It exercises the real candidate lists, supports_op rejection and allocation fallback.
+struct assignment_provider {
+    ggml_backend_reg reg = {};
+    ggml_backend_device device = {};
+    ggml_backend_buffer_type host = {}, gpu = {};
+    bool reject_gpu = false;
+    bool host_fallback = false;
+    size_t rejected = 0;
+
+    static bool uses_type(const ggml_tensor * tensor, ggml_backend_buffer_type_t type) {
+        if (tensor->buffer && ggml_backend_buffer_get_type(tensor->buffer) == type) { return true; }
+        for (auto * src : tensor->src) {
+            if (src && uses_type(src, type)) { return true; }
+        }
+        return false;
+    }
+
+    assignment_provider() {
+        reg.api_version = GGML_BACKEND_API_VERSION;
+        reg.iface.get_name = [](ggml_backend_reg_t) { return "TestAssignment"; };
+        device.reg = &reg;
+        device.context = this;
+        device.iface.get_name = [](ggml_backend_dev_t) { return "TestAssignmentGPU"; };
+        device.iface.get_description = device.iface.get_name;
+        device.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+        device.iface.get_memory = [](ggml_backend_dev_t, size_t * free, size_t * total) {
+            *free = *total = 1024 * 1024 * 1024;
+        };
+        device.iface.get_props = [](ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+            *props = {};
+            props->name = ggml_backend_dev_name(dev);
+            props->description = props->name;
+            props->type = GGML_BACKEND_DEVICE_TYPE_GPU;
+            props->caps.host_buffer = true;
+        };
+        device.iface.get_buffer_type = [](ggml_backend_dev_t dev) {
+            return &static_cast<assignment_provider *>(dev->context)->gpu;
+        };
+        device.iface.get_host_buffer_type = [](ggml_backend_dev_t dev) {
+            return &static_cast<assignment_provider *>(dev->context)->host;
+        };
+        device.iface.supports_op = [](ggml_backend_dev_t dev, const ggml_tensor * op) {
+            auto & provider = *static_cast<assignment_provider *>(dev->context);
+            const bool rejected = provider.reject_gpu && uses_type(op, &provider.gpu);
+            provider.rejected += rejected;
+            return !rejected;
+        };
+        device.iface.supports_buft = [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+            return buft->device == dev;
+        };
+        for (auto * buft : {&host, &gpu}) {
+            buft->device = &device;
+            buft->context = this;
+            buft->iface.get_name = [](ggml_backend_buffer_type_t type) {
+                auto & provider = *static_cast<assignment_provider *>(type->context);
+                return type == &provider.host ? "TestAssignmentHost" : "TestAssignmentDevice";
+            };
+            buft->iface.get_alignment = [](ggml_backend_buffer_type_t) { return size_t(64); };
+            buft->iface.is_host = [](ggml_backend_buffer_type_t type) {
+                return type == &static_cast<assignment_provider *>(type->context)->host;
+            };
+            buft->iface.alloc_buffer = [](ggml_backend_buffer_type_t type, size_t size) {
+                auto & provider = *static_cast<assignment_provider *>(type->context);
+                auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+                if (buffer && !(type == &provider.host && provider.host_fallback)) {
+                    buffer->buft = type;
+                }
+                return buffer;
+            };
+        }
+    }
+};
+
+static void test_assignments(const char * path) {
+    assignment_provider provider;
+    ggml_backend_dev_t devices[] = {&provider.device, nullptr};
+    auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu);
+    enum scenario { full, partial, rejected, fallback, mapped, host_override, cpu_override, gpu_override };
+    for (auto test : {full, partial, rejected, fallback, mapped, host_override, cpu_override, gpu_override}) {
+        auto params = model_params();
+        params.devices = devices;
+        params.n_gpu_layers = test == partial ? 2 : 3;
+        params.load_mode = test == mapped ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+        provider.reject_gpu = test == rejected;
+        provider.host_fallback = test == fallback;
+        provider.rejected = 0;
+        llama_model_tensor_buft_override overrides[] = {
+            {"token_embd\\.weight", test == cpu_override ? ggml_backend_cpu_buffer_type() :
+                                  test == gpu_override ? &provider.gpu : &provider.host},
+            {nullptr, nullptr},
+        };
+        if (test == host_override || test == cpu_override || test == gpu_override) {
+            params.tensor_buft_overrides = overrides;
+        }
+        llama_model_ptr model(llama_model_load_from_file(path, params));
+        GGML_ASSERT(model);
+        size_t inputs = 0, outputs = 0, cpu_layers = 0, gpu_layers = 0;
+        GGML_ASSERT(llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) {
+            GGML_ASSERT(view.known && view.buffer);
+            bool on_cpu = view.part == LLAMA_MEMORY_MODEL_PART_INPUT || test == rejected ||
+                (test == partial && view.part == LLAMA_MEMORY_MODEL_PART_REPEATING && view.layer == 0);
+            if (test == gpu_override && view.part == LLAMA_MEMORY_MODEL_PART_INPUT) { on_cpu = false; }
+            const auto & assignment = view.assignment;
+            if (test == cpu_override && assignment.source == LLAMA_MEMORY_ASSIGNMENT_OVERRIDE) { on_cpu = true; }
+            auto * expected = on_cpu ? cpu : &provider.device;
+            if (test == host_override && assignment.source == LLAMA_MEMORY_ASSIGNMENT_OVERRIDE) {
+                GGML_ASSERT(!assignment.device); // raw GPU-provided host storage does not prove assignment
+                GGML_ASSERT(assignment.source == LLAMA_MEMORY_ASSIGNMENT_OVERRIDE);
+            } else {
+                if (assignment.device != expected) {
+                    std::fprintf(stderr, "assignment scenario %d part %d layer %d: expected %s, got %s (%s)\n",
+                        int(test), int(view.part), view.layer, ggml_backend_dev_name(expected),
+                        assignment.device ? ggml_backend_dev_name(assignment.device) : "unknown",
+                        ggml_backend_buffer_name(view.buffer));
+                }
+                GGML_ASSERT(assignment.device == expected);
+            }
+            if (on_cpu && test != mapped && test != fallback) {
+                GGML_ASSERT(ggml_backend_buffer_get_type(view.buffer) == &provider.host);
+                GGML_ASSERT(ggml_backend_buft_get_device(&provider.host) == &provider.device);
+            }
+            if (view.part == LLAMA_MEMORY_MODEL_PART_INPUT) {
+                ++inputs;
+                if (test == mapped) {
+                    GGML_ASSERT(assignment.source == LLAMA_MEMORY_ASSIGNMENT_MMAP);
+                    GGML_ASSERT(ggml_backend_buffer_get_type(view.buffer) != &provider.host);
+                } else if (test == host_override || test == cpu_override || test == gpu_override) {
+                    GGML_ASSERT(assignment.source == LLAMA_MEMORY_ASSIGNMENT_OVERRIDE);
+                } else if (test != host_override) {
+                    GGML_ASSERT(assignment.selection_device == &provider.device);
+                    GGML_ASSERT(assignment.source == LLAMA_MEMORY_ASSIGNMENT_SELECTION);
+                }
+            } else if (view.part == LLAMA_MEMORY_MODEL_PART_OUTPUT) {
+                ++outputs;
+            } else if (view.part == LLAMA_MEMORY_MODEL_PART_REPEATING) {
+                (on_cpu ? cpu_layers : gpu_layers)++;
+            }
+        }));
+        GGML_ASSERT(inputs && outputs && (cpu_layers || gpu_layers));
+        GGML_ASSERT((provider.rejected > 0) == (test == rejected));
+        if (test == partial) { GGML_ASSERT(cpu_layers && gpu_layers); }
+    }
+    // A changed allocation must not turn a formerly selected GPU into a proved CPU assignment.
+    auto data = metadata("llama");
+    auto params = model_params();
+    params.devices = devices;
+    params.n_gpu_layers = 3;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    provider.reject_gpu = provider.host_fallback = false;
+    struct init_data { std::set<ggml_backend_buffer_t> buffers; ggml_tensor * gpu_tensor = nullptr; } initialized;
+    llama_model_ptr model(llama_model_init_from_user(data.get(), [](ggml_tensor * tensor, void * opaque) {
+        auto & init = *static_cast<init_data *>(opaque);
+        initialize_tensor(tensor, &init.buffers);
+        if (!ggml_backend_buffer_is_host(tensor->buffer)) { init.gpu_tensor = tensor; }
+    }, &initialized, params));
+    GGML_ASSERT(model && initialized.gpu_tensor);
+    auto * saved = initialized.gpu_tensor->buffer;
+    auto * replacement = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 64);
+    GGML_ASSERT(replacement);
+    initialized.gpu_tensor->buffer = replacement;
+    size_t invalidated = 0;
+    GGML_ASSERT(llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) {
+        if (view.buffer == replacement) {
+            GGML_ASSERT(view.known && !view.assignment.device);
+            ++invalidated;
+        }
+    }));
+    GGML_ASSERT(invalidated);
+    initialized.gpu_tensor->buffer = saved;
+    ggml_backend_buffer_free(replacement);
+    std::puts("memory placement: loader assignments PASSED");
+}
+
 static llama_context_ptr context(llama_model * model, bool embeddings = false) {
     auto params = llama_context_default_params();
     params.n_ctx = 256;
@@ -185,6 +362,8 @@ static void check_placement(const llama_model * model, int32_t expected_layers, 
     GGML_ASSERT(llama_model_visit_placement(model, [&](const llama_memory_placement_view & view) {
         GGML_ASSERT(view.known && view.buffer);
         GGML_ASSERT(ggml_backend_buffer_is_host(view.buffer));
+        GGML_ASSERT(view.assignment.device);
+        GGML_ASSERT(ggml_backend_dev_type(view.assignment.device) == GGML_BACKEND_DEVICE_TYPE_CPU);
         if (view.part == LLAMA_MEMORY_MODEL_PART_REPEATING) {
             layers.insert(view.layer);
         } else if (view.part == LLAMA_MEMORY_MODEL_PART_MTP) {
@@ -270,6 +449,7 @@ static void test_tied_output(const char * path) {
     }));
     GGML_ASSERT(output_roles >= 2); // output norm and the aliased embedding weight
     model.reset();
+    test_assignments(tied_path.c_str());
     GGML_ASSERT(std::remove(tied_path.c_str()) == 0);
 }
 
@@ -294,6 +474,8 @@ static void test_missing_placement() {
     GGML_ASSERT(!llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) {
         if (!view.known) {
             GGML_ASSERT(view.buffer == nullptr);
+            GGML_ASSERT(!view.assignment.device);
+            GGML_ASSERT(view.assignment.source == LLAMA_MEMORY_ASSIGNMENT_UNKNOWN);
             ++unknown;
         }
     }));
@@ -403,6 +585,7 @@ static void test_model(const std::string & arch, const char * model_path) {
             mapped_collector.reset();
 #endif
         }
+        test_assignments(model_path);
         test_tied_output(model_path);
         GGML_ASSERT(std::remove(model_path) == 0);
     }

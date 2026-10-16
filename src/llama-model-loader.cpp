@@ -1064,17 +1064,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static llama_memory_tensor_assignment select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
-        ggml_backend_dev_t cur_dev = cur.first;
-        ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
-            return cur_buft;
+        if (weight_buft_supported(hparams, tensor, op, cur.buft, cur.device)) {
+            return {cur.assignment_device, cur.device, cur.buft, LLAMA_MEMORY_ASSIGNMENT_SELECTION};
         }
     }
 
-    return nullptr;
+    return {};
 }
 
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
@@ -1115,7 +1113,18 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        llama_memory_tensor_assignment * assignment) {
+    llama_memory_tensor_assignment selected;
+    if (assignment) {
+        *assignment = {};
+    }
+    const auto record_assignment = [&](ggml_tensor * tensor) {
+        if (assignment && tensor) {
+            *assignment = selected;
+        }
+        return tensor;
+    };
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
@@ -1209,7 +1218,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (is_lazy) {
-            return lazy_read::buft();
+            auto * buft = lazy_read::buft();
+            selected = {ggml_backend_buft_get_device(buft), nullptr, buft, LLAMA_MEMORY_ASSIGNMENT_LAZY};
+            if (!selected.device) {
+                selected.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            return buft;
         }
 
         // select the buffer type for this tensor
@@ -1239,7 +1253,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        selected = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        selected.source = LLAMA_MEMORY_ASSIGNMENT_OVERRIDE;
+                        buft = selected.buffer_type;
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1248,6 +1264,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        auto * device = ggml_backend_buft_get_device(buft);
+                        if (ggml_backend_buft_is_host(buft) && device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            device = nullptr;
+                        }
+                        selected = {device, nullptr, buft, LLAMA_MEMORY_ASSIGNMENT_OVERRIDE};
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1260,7 +1281,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            selected = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = selected.buffer_type;
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
@@ -1274,13 +1296,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error("no CPU backend found");
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
+            selected = {cpu_dev, nullptr, buft, LLAMA_MEMORY_ASSIGNMENT_MMAP};
         }
 
-        if (buft != buft_list->front().second) {
+        if (buft != buft_list->front().buft) {
             if (n_tensors_moved == 0) {
                 first_tensor_moved_name = t_meta->name;
                 first_tensor_moved_type_name = ggml_type_name(t_meta->type);
-                first_moved_from_buft = buft_list->front().second;
+                first_moved_from_buft = buft_list->front().buft;
                 first_moved_to_buft   = buft;
             }
             n_tensors_moved++;
@@ -1330,7 +1353,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
-        return ret;
+        return record_assignment(ret);
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
@@ -1371,7 +1394,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_DUPLICATED) {
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
         if (t) {
-            return t;
+            return record_assignment(t);
         }
     }
 
@@ -1386,7 +1409,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
-    return tensor;
+    return record_assignment(tensor);
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

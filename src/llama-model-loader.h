@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-memory-placement.h"
 
 #include "ggml-cpp.h"
 
@@ -19,7 +20,13 @@
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 // lists of buffer types used for each layer
-using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+struct llama_buft_candidate {
+    ggml_backend_dev_t device;
+    ggml_backend_buffer_type_t buft;
+    ggml_backend_dev_t assignment_device;
+};
+
+using buft_list_t = std::vector<llama_buft_candidate>;
 
 enum llama_fver {
     GGUF_FILE_VERSION_V1 = 1,
@@ -236,7 +243,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        llama_memory_tensor_assignment * assignment = nullptr);
 
     void done_getting_tensors(bool partial = false) const;
 

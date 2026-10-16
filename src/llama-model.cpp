@@ -1126,7 +1126,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
             auto * buft = ggml_backend_dev_buffer_type(dev);
             // skip
             if (buft != ggml_backend_cpu_buffer_type()) {
-                buft_list.emplace_back(dev, buft);
+                buft_list.push_back({dev, buft, dev});
             }
         }
     }
@@ -1141,7 +1141,8 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
         for (const auto & dev : devices) {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
             if (buft) {
-                buft_list.emplace_back(dev.dev, buft);
+                // Host storage serves the CPU candidate path, even when a GPU validates its supported ops.
+                buft_list.push_back({dev.dev, buft, ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)});
                 break;
             }
         }
@@ -1160,7 +1161,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
         if (ggml_backend_dev_get_extra_bufts_fn) {
             ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(cpu_dev);
             while (extra_bufts && *extra_bufts) {
-                buft_list.emplace_back(cpu_dev, *extra_bufts);
+                buft_list.push_back({cpu_dev, *extra_bufts, cpu_dev});
                 ++extra_bufts;
             }
         }
@@ -1170,7 +1171,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+            buft_list.push_back({dev, ggml_backend_dev_buffer_type(dev), dev});
         }
     }
 
@@ -1198,7 +1199,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             }();
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
             if (buft != nullptr) {
-                buft_list.emplace_back(dev, buft);
+                buft_list.push_back({dev, buft, dev});
             }
         } else {
             throw std::runtime_error(format("device %s does not support split buffers", ggml_backend_dev_name(dev)));
@@ -1206,7 +1207,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     }
 
     // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    buft_list.push_back({dev, ggml_backend_dev_buffer_type(dev), dev});
 
     // add the device extra buffer type (if any)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1217,7 +1218,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         if (ggml_backend_dev_get_extra_bufts_fn) {
             ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
             while (extra_bufts && *extra_bufts) {
-                buft_list.emplace_back(dev, *extra_bufts);
+                buft_list.push_back({dev, *extra_bufts, dev});
                 ++extra_bufts;
             }
         }
@@ -2027,11 +2028,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+    llama_memory_tensor_assignment assignment;
     auto * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn, ne, flags, &assignment);
     llama_memory_record_tensor_role(pimpl->memory_tensor_roles, tensor, tn,
-        (flags & TENSOR_DUPLICATED) != 0, hparams.n_layer(), hparams.n_layer_all);
+        (flags & TENSOR_DUPLICATED) != 0, hparams.n_layer(), hparams.n_layer_all, assignment);
     return tensor;
 }
 
@@ -2401,8 +2403,8 @@ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t d
 template<typename F>
 static ggml_backend_buffer_type_t select_buft(const buft_list_t & buft_list, const F & fn) {
     for (const auto & cur : buft_list) {
-        ggml_backend_dev_t cur_dev = cur.first;
-        ggml_backend_buffer_type_t cur_buft = cur.second;
+        ggml_backend_dev_t cur_dev = cur.device;
+        ggml_backend_buffer_type_t cur_buft = cur.buft;
         if (buft_supported(cur_buft, cur_dev, fn)) {
             return cur_buft;
         }

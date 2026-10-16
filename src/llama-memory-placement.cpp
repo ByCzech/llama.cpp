@@ -5,7 +5,8 @@
 
 void llama_memory_record_tensor_role(
         std::vector<llama_memory_tensor_role> & roles, const ggml_tensor * tensor,
-        const LLM_TN_IMPL & name, bool duplicated, int32_t n_layer, int32_t n_layer_all) {
+        const LLM_TN_IMPL & name, bool duplicated, int32_t n_layer, int32_t n_layer_all,
+        const llama_memory_tensor_assignment & assignment) {
     if (!tensor) {
         return;
     }
@@ -24,7 +25,7 @@ void llama_memory_record_tensor_role(
         part = name.bid < n_layer ? LLAMA_MEMORY_MODEL_PART_REPEATING : LLAMA_MEMORY_MODEL_PART_MTP;
         index = name.bid;
     }
-    roles.push_back({tensor, part, index});
+    roles.push_back({tensor, part, index, assignment});
 }
 
 bool llama_memory_visit_tensor_roles(
@@ -36,7 +37,20 @@ bool llama_memory_visit_tensor_roles(
     std::set<int32_t> layers;
     for (const auto & role : roles) {
         auto * buffer = llama_memory_tensor_buffer(role.tensor);
-        visitor({role.part, role.layer, buffer, buffer != nullptr});
+        auto assignment = role.assignment;
+        if (!buffer) {
+            assignment = {};
+        } else if (assignment.buffer_type != ggml_backend_buffer_get_type(buffer)) {
+            auto * actual = ggml_backend_memory_buffer_device(buffer);
+            // Host allocators can fall back to CPU buffers; mmap can wrap CPU memory in a different type.
+            const bool cpu_host = assignment.device && actual &&
+                ggml_backend_dev_type(assignment.device) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                ggml_backend_dev_type(actual) == GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_buffer_is_host(buffer);
+            if (!cpu_host) {
+                assignment.device = nullptr;
+            }
+        }
+        visitor({role.part, role.layer, buffer, buffer != nullptr, assignment});
         complete = buffer != nullptr && complete;
         classified.insert(role.tensor);
         if (role.layer >= 0) {
