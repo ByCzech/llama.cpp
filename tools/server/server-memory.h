@@ -34,7 +34,10 @@ public:
 
 private:
     struct layer {
-        std::set<std::string> devices;
+        std::set<std::string> devices; // buffer providers
+        std::set<std::string> assigned_devices;
+        std::set<std::string> sources;
+        std::set<std::string> reasons;
         bool cpu = false;
         bool accelerator = false;
         bool unknown = false;

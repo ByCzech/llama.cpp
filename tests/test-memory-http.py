@@ -122,6 +122,14 @@ def validate(report):
         assert set(group["device_ids"]) <= devices
         assert group["location"] in ("cpu", "accelerator", "mixed", "unknown")
         assert len(group["layer_indices"]) == len(set(group["layer_indices"]))
+        if "assignment" in group:
+            evidence = group["assignment"]
+            assert set(evidence) == {"status", "device_ids", "sources", "reasons"}
+            assert evidence["status"] in ("known", "partial", "unavailable")
+            assert set(evidence["device_ids"]) <= devices
+            assert set(evidence["sources"]) <= {"loader_selection", "loader_override", "loader_mmap",
+                                               "loader_lazy", "native_buffer"}
+            assert evidence["status"] != "known" or not evidence["reasons"]
 
 
 def test_loaded_auth_and_stream(server, model, directory, mmap):
@@ -135,6 +143,11 @@ def test_loaded_auth_and_stream(server, model, directory, mmap):
         assert initial["model_state"] == "loaded"
         assert initial["snapshot_stage"] == "after_load"
         assert initial["placement"]["status"] == "known", initial["placement"]
+        cpu_devices = {item["id"] for item in initial["devices"] if item["type"] == "cpu"}
+        for group in initial["placement"]["layer_groups"]:
+            assert group["assignment"]["status"] == "known"
+            assert group["assignment"]["device_ids"] and set(group["assignment"]["device_ids"]) <= cpu_devices
+            assert group["assignment"]["sources"] == ["loader_selection"]
         assert all(item["memory_kind"] == "host" for item in initial["buffers"])
         weights = [item for item in initial["buffers"] if any(
             owner["component"] == "model_weights" for owner in item["owners"])]

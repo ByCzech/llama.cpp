@@ -90,14 +90,47 @@ Typical missing reasons are `collector_not_implemented`, `opaque_composite`,
 ## Weight placement
 
 `placement` has `status`, `missing_components`, and `layer_groups`. Each group has
-`owner_id`, `component`, `layer_indices`, `location`, and `device_ids`.
+`owner_id`, `component`, `layer_indices`, `location`, and `device_ids`. Groups may
+also contain the optional `assignment` object described below; V1 readers must
+accept its absence in older workers. Group `device_ids` still identify buffer
+providers.
 
 Components are `input_weights`, `output_weights`, `repeating_layers`, `mtp_layers`,
 or `other_weights`. Non-layer groups have an empty `layer_indices` array.
-`location` is `cpu`, `accelerator`, `mixed`, or `unknown`, based on actual tensor
-buffers, never the requested GPU-layer count. Unknown placement takes precedence
-over a partial observation. Additional placement reasons include
-`tensor_unclassified`, `device_unknown`, and `opaque_distribution`.
+`location` is `cpu`, `accelerator`, `mixed`, or `unknown`, based on the final
+loader assignment validated against actual tensor buffers. Older paths without
+loader evidence retain the unambiguous native-buffer classification. The
+requested GPU-layer count is never placement evidence. Unknown placement takes
+precedence over a partial observation. Additional placement reasons include
+`tensor_unclassified`, `device_unknown`, `opaque_distribution`, and
+`assignment_unknown`.
+
+The optional `assignment` object has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `known` if all tensor roles in the group have proved assignments, `partial` if only some do, or `unavailable` if none do. |
+| `device_ids` | Deduplicated proved assignment devices, referencing the same snapshot `devices` array. Can include known devices in a partial group. |
+| `sources` | Deduplicated evidence sources: `loader_selection`, `loader_override`, `loader_mmap`, `loader_lazy`, or `native_buffer`. |
+| `reasons` | Deduplicated reasons for missing assignment evidence; empty when known. |
+
+Loader sources identify decisions retained for each tensor role. A source can
+also describe an unresolved decision, such as an ambiguous raw host-buffer
+override; consult `status` and `reasons`. A loader decision that became invalid
+is not replaced by a native-buffer guess. `native_buffer` applies only when the
+path supplied no loader evidence and the provider/type gives an unambiguous
+classification. Opaque composites remain unknown even with a loader device.
+Groups merge only when provider IDs, assignment IDs, sources, reasons and
+coverage agree.
+
+For example, CPU-assigned input weights can reside in a GPU-provided pinned
+host buffer. Their group has `location=cpu`, provider `device_ids` referencing
+the GPU, and `assignment.device_ids` referencing the CPU. The buffer retains
+`memory_kind=host_pinned`, its GPU provider and its original `size_bytes`.
+Devices used only as assignment evidence can therefore appear in `devices`
+without providing a buffer. Neither assignment IDs nor provider IDs identify a
+physical memory heap. A mixed group can have one provider and multiple proved
+assignment devices.
 
 Placement describes weight storage/backend assignment, not where every operation
 executes. CPU context state and projector buffers remain visible independently;
@@ -130,4 +163,7 @@ downloads no model. It tests authentication, schema, mmap/allocated backing,
 reads during an unbounded stream, request snapshots, sleep/reload, and router
 exclusion. Native tests separately compare sizes with live buffer APIs and cover
 shared weights, output growth, hybrid state, LoRA, missing and opaque buffers.
+A CPU-backed test provider exercises the real loader's host assignment, partial
+offload, overrides, fallback, mmap and tied-weight paths through JSON collection;
+a 40-layer fixture checks the 0-20 CPU / 21-39 GPU boundary and GPU output.
 Actual GPU inference and vision/projector runs require separate hardware checks.

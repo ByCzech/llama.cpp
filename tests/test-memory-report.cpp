@@ -121,6 +121,68 @@ static void test_device_classification() {
     GGML_ASSERT(mixed && integrated && unknown);
 }
 
+static void test_assignment_evidence() {
+    fixture cpu(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    fixture pinned(GGML_BACKEND_DEVICE_TYPE_IGPU, true, GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED);
+    fixture opaque(GGML_BACKEND_DEVICE_TYPE_META, false, GGML_BACKEND_MEMORY_BUFFER_OPAQUE);
+    server_memory_collector collector;
+    const auto owner = collector.owner(&collector, "model", "main");
+    collector.buffer(owner, view(&pinned.buf));
+    collector.buffer(owner, view(&cpu.buf));
+    const llama_memory_tensor_assignment selected = {&cpu.dev, &pinned.dev, &pinned.type, LLAMA_MEMORY_ASSIGNMENT_SELECTION};
+    auto overridden = selected;
+    overridden.source = LLAMA_MEMORY_ASSIGNMENT_OVERRIDE;
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 0, &pinned.buf, true, selected});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 1, &pinned.buf, true, overridden});
+    auto gpu = selected;
+    gpu.device = &pinned.dev;
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 2, &pinned.buf, true, gpu});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 3, &pinned.buf, true, selected});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 3, &pinned.buf, true, gpu});
+    auto unknown = overridden;
+    unknown.device = nullptr;
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 4, &pinned.buf, true, unknown});
+    // Invalidated loader evidence must not fall back to this buffer's CPU provider.
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 5, &cpu.buf, true, unknown});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 6, &cpu.buf, true});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 7, &opaque.buf, true, selected});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 8, &pinned.buf, false, selected});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 9, &pinned.buf, true, selected});
+    collector.placement(owner, {LLAMA_MEMORY_MODEL_PART_REPEATING, 9, &pinned.buf, true, unknown});
+    const auto result = collector.finish();
+    GGML_ASSERT(result["status"] == "known" && total(result) == 8192);
+    GGML_ASSERT(result["buffers"][0]["memory_kind"] == "host_pinned");
+    GGML_ASSERT(result["buffers"][0]["device_ids"] == json::array({"d1"}));
+    GGML_ASSERT(result["placement"]["status"] == "partial");
+    const auto & groups = result["placement"]["layer_groups"];
+    GGML_ASSERT(groups.size() == 10); // source, assignment and coverage differences prevent merging
+    for (const auto & group : groups) {
+        const auto index = group["layer_indices"][0].get<int>();
+        const auto & evidence = group["assignment"];
+        if (index == 0 || index == 1) {
+            GGML_ASSERT(group["location"] == "cpu");
+            GGML_ASSERT(group["device_ids"] == json::array({"d1"}));
+            GGML_ASSERT(evidence["device_ids"] == json::array({"d2"}));
+            GGML_ASSERT(evidence["sources"] == json::array({index == 0 ? "loader_selection" : "loader_override"}));
+        } else if (index == 2) {
+            GGML_ASSERT(group["location"] == "accelerator");
+            GGML_ASSERT(evidence["device_ids"] == json::array({"d1"}));
+        } else if (index == 3) {
+            GGML_ASSERT(group["location"] == "mixed");
+            GGML_ASSERT(evidence["device_ids"].size() == 2);
+        } else if (index == 6) {
+            GGML_ASSERT(group["location"] == "cpu");
+            GGML_ASSERT(evidence["sources"] == json::array({"native_buffer"}));
+        } else {
+            GGML_ASSERT(group["location"] == "unknown");
+            GGML_ASSERT(evidence["status"] == (index == 9 ? "partial" : "unavailable"));
+            GGML_ASSERT(evidence["device_ids"].size() == (index == 9 ? 1u : 0u));
+            GGML_ASSERT(evidence["reasons"] == json::array({index == 7 ? "opaque_distribution" :
+                index == 8 ? "tensor_unclassified" : "assignment_unknown"}));
+        }
+    }
+}
+
 static void test_partial_and_unknown() {
     fixture known(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     fixture opaque(GGML_BACKEND_DEVICE_TYPE_META, false, GGML_BACKEND_MEMORY_BUFFER_OPAQUE);
@@ -159,6 +221,7 @@ int main() {
     ggml_backend_load_all();
     test_deduplication();
     test_device_classification();
+    test_assignment_evidence();
     test_partial_and_unknown();
     std::puts("memory report PASSED");
 }

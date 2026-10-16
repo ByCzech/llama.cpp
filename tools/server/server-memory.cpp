@@ -55,6 +55,17 @@ const char * device_type(ggml_backend_dev_t native) {
     return "unknown";
 }
 
+const char * assignment_source(llama_memory_assignment_source source) {
+    switch (source) {
+        case LLAMA_MEMORY_ASSIGNMENT_SELECTION: return "loader_selection";
+        case LLAMA_MEMORY_ASSIGNMENT_OVERRIDE: return "loader_override";
+        case LLAMA_MEMORY_ASSIGNMENT_MMAP: return "loader_mmap";
+        case LLAMA_MEMORY_ASSIGNMENT_LAZY: return "loader_lazy";
+        case LLAMA_MEMORY_ASSIGNMENT_UNKNOWN: return nullptr;
+    }
+    return nullptr;
+}
+
 const char * backing_name(llama_memory_backing backing) {
     switch (backing) {
         case LLAMA_MEMORY_BACKING_ALLOCATED: return "allocated";
@@ -175,26 +186,44 @@ void server_memory_collector::placement(size_t owner_index, const llama_memory_p
     for (const auto & id : device(native)) {
         current.devices.insert(id.get<std::string>());
     }
+    const auto & assignment = view.assignment;
+    const char * source = assignment_source(assignment.source);
+    ggml_backend_dev_t assigned = nullptr;
     const char * reason = nullptr;
     if (!view.known || !view.buffer) {
         reason = "tensor_unclassified";
+    } else if ((ggml_backend_memory_buffer_flags(view.buffer) & GGML_BACKEND_MEMORY_BUFFER_OPAQUE) ||
+               (native && ggml_backend_dev_type(native) == GGML_BACKEND_DEVICE_TYPE_META)) {
+        reason = "opaque_distribution";
+    } else if (assignment.source != LLAMA_MEMORY_ASSIGNMENT_UNKNOWN) {
+        // A failed or invalidated loader decision must not become a buffer-based guess.
+        assigned = source ? assignment.device : nullptr;
+        if (!assigned) { reason = "assignment_unknown"; }
     } else if (!native) {
         reason = "device_unknown";
-    } else if ((ggml_backend_memory_buffer_flags(view.buffer) & GGML_BACKEND_MEMORY_BUFFER_OPAQUE) ||
-               ggml_backend_dev_type(native) == GGML_BACKEND_DEVICE_TYPE_META) {
-        reason = "opaque_distribution";
-    } else if (ggml_backend_dev_type(native) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-        current.cpu = true;
-        placement_usable = true;
-    } else if (ggml_backend_buffer_is_host(view.buffer)) {
-        // A GPU provider's host buffer alone does not identify an execution/backend assignment.
+    } else if (ggml_backend_dev_type(native) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_buffer_is_host(view.buffer)) {
         reason = "opaque_distribution";
     } else {
-        current.accelerator = true;
+        assigned = native;
+        source = "native_buffer";
+    }
+    if (assigned && ggml_backend_dev_type(assigned) == GGML_BACKEND_DEVICE_TYPE_META) {
+        assigned = nullptr;
+        reason = "opaque_distribution";
+    }
+    if (source) { current.sources.insert(source); }
+    if (assigned) {
+        for (const auto & id : device(assigned)) { current.assigned_devices.insert(id.get<std::string>()); }
+        if (ggml_backend_dev_type(assigned) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            current.cpu = true;
+        } else {
+            current.accelerator = true;
+        }
         placement_usable = true;
     }
     if (reason) {
         current.unknown = true;
+        current.reasons.insert(reason);
         missing(owner_index, part_name(view.part), reason, true);
     }
 }
@@ -215,11 +244,14 @@ json server_memory_collector::finish() const {
             ids.push_back(id);
         }
         json group = {{"owner_id", data["owners"][owner_index]["id"]}, {"component", part_name(part)},
-            {"layer_indices", json::array()}, {"location", location}, {"device_ids", ids}};
+            {"layer_indices", json::array()}, {"location", location}, {"device_ids", ids},
+            {"assignment", {{"status", current.unknown ? (current.cpu || current.accelerator ? "partial" : "unavailable") : "known"},
+                {"device_ids", current.assigned_devices}, {"sources", current.sources}, {"reasons", current.reasons}}}};
         bool merged = false;
         for (auto & existing : placement["layer_groups"]) {
             if (existing["owner_id"] == group["owner_id"] && existing["component"] == group["component"] &&
-                existing["location"] == group["location"] && existing["device_ids"] == ids) {
+                existing["location"] == group["location"] && existing["device_ids"] == ids &&
+                existing["assignment"] == group["assignment"]) {
                 if (layer_index >= 0) {
                     existing["layer_indices"].push_back(layer_index);
                 }

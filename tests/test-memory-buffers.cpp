@@ -13,6 +13,7 @@
 #endif
 
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
@@ -161,6 +162,15 @@ struct assignment_provider {
     assignment_provider() {
         reg.api_version = GGML_BACKEND_API_VERSION;
         reg.iface.get_name = [](ggml_backend_reg_t) { return "TestAssignment"; };
+        reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
+            if (std::strcmp(name, "tllama_buffer_memory_flags") != 0) { return nullptr; }
+            static ggml_backend_memory_buffer_flags_t flags = [](ggml_backend_buffer_t buffer) -> uint32_t {
+                auto * type = ggml_backend_buffer_get_type(buffer);
+                auto & provider = *static_cast<assignment_provider *>(type->context);
+                return type == &provider.host ? GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED : 0;
+            };
+            return reinterpret_cast<void *>(flags);
+        };
         device.reg = &reg;
         device.context = this;
         device.iface.get_name = [](ggml_backend_dev_t) { return "TestAssignmentGPU"; };
@@ -214,7 +224,10 @@ struct assignment_provider {
     }
 };
 
-static void test_assignments(const char * path) {
+static void test_assignments(const char * path, bool tied = false) {
+#ifndef TLLAMA_TEST_MEMORY_REPORT
+    (void) tied;
+#endif
     assignment_provider provider;
     ggml_backend_dev_t devices[] = {&provider.device, nullptr};
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -283,6 +296,81 @@ static void test_assignments(const char * path) {
         GGML_ASSERT(inputs && outputs && (cpu_layers || gpu_layers));
         GGML_ASSERT((provider.rejected > 0) == (test == rejected));
         if (test == partial) { GGML_ASSERT(cpu_layers && gpu_layers); }
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+        server_memory_collector collector, legacy;
+        const auto owner = collector.owner(model.get(), "model", "main");
+        const auto old_owner = legacy.owner(model.get(), "model", "main");
+        GGML_ASSERT(llama_model_visit_buffers(model.get(), [&](const llama_memory_buffer_view & view) {
+            collector.buffer(owner, view);
+            legacy.buffer(old_owner, view);
+        }));
+        GGML_ASSERT(llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) {
+            collector.placement(owner, view);
+            auto old = view;
+            old.assignment = {};
+            legacy.placement(old_owner, old);
+        }));
+        const auto report = collector.finish();
+        const auto before = legacy.finish();
+        GGML_ASSERT(report["status"] == "known");
+        GGML_ASSERT(report["buffers"] == before["buffers"] && report["owners"] == before["owners"]);
+        GGML_ASSERT(report["placement"]["status"] == (test == host_override ? "partial" : "known"));
+        if (test == full) {
+            GGML_ASSERT(before["placement"]["status"] == "partial");
+            GGML_ASSERT(report["devices"].size() == 2); // provider GPU and assigned CPU
+            bool pinned = false;
+            for (const auto & buffer : report["buffers"]) { pinned |= buffer["memory_kind"] == "host_pinned"; }
+            GGML_ASSERT(pinned);
+        }
+        size_t layer_count = 0, input_count = 0, output_count = 0;
+        for (const auto & group : report["placement"]["layer_groups"]) {
+            const auto & component = group["component"];
+            const auto & evidence = group["assignment"];
+            std::set<std::string> assigned_types;
+            for (const auto & id : evidence["device_ids"]) {
+                bool found = false;
+                for (const auto & device : report["devices"]) {
+                    if (device["id"] == id) {
+                        assigned_types.insert(device["type"].get<std::string>());
+                        found = true;
+                    }
+                }
+                GGML_ASSERT(found);
+            }
+            std::string expected = "accelerator";
+            if (component == "input_weights") {
+                ++input_count;
+                expected = test == host_override ? "unknown" : test == gpu_override ? "accelerator" : "cpu";
+                if (test == full) {
+                    GGML_ASSERT(group["device_ids"] != evidence["device_ids"]);
+                    GGML_ASSERT(evidence["sources"] == json::array({"loader_selection"}));
+                }
+            } else if (component == "output_weights") {
+                ++output_count;
+                if (test == rejected) { expected = "cpu"; }
+                if (tied && test == cpu_override) { expected = "mixed"; }
+                if (tied && test == host_override) { expected = "unknown"; }
+            } else {
+                GGML_ASSERT(component == "repeating_layers");
+                for (const auto & index : group["layer_indices"]) {
+                    ++layer_count;
+                    const auto location = test == rejected || (test == partial && index == 0) ? "cpu" : "accelerator";
+                    GGML_ASSERT(group["location"] == location);
+                }
+                expected = group["location"].get<std::string>();
+            }
+            GGML_ASSERT(group["location"] == expected);
+            if (expected == "unknown") {
+                GGML_ASSERT(evidence["status"] == (component == "output_weights" ? "partial" : "unavailable"));
+                GGML_ASSERT(evidence["reasons"] == json::array({"assignment_unknown"}));
+            } else {
+                GGML_ASSERT(evidence["status"] == "known" && evidence["reasons"].empty());
+                GGML_ASSERT(assigned_types == (expected == "mixed" ? std::set<std::string>{"cpu", "gpu"} :
+                    std::set<std::string>{expected == "cpu" ? "cpu" : "gpu"}));
+            }
+        }
+        GGML_ASSERT(layer_count == 2 && input_count == 1 && output_count == 1);
+#endif
     }
     // A changed allocation must not turn a formerly selected GPU into a proved CPU assignment.
     auto data = metadata("llama");
@@ -314,6 +402,43 @@ static void test_assignments(const char * path) {
     ggml_backend_buffer_free(replacement);
     std::puts("memory placement: loader assignments PASSED");
 }
+
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+static void test_partial_assignment_report() {
+    assignment_provider provider;
+    ggml_backend_dev_t devices[] = {&provider.device, nullptr};
+    auto data = metadata("llama");
+    gguf_set_val_u32(data.get(), "llama.block_count", 40);
+    auto params = model_params();
+    params.devices = devices;
+    params.n_gpu_layers = 20; // 19 repeating layers plus output
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    std::set<ggml_backend_buffer_t> initialized;
+    llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, params));
+    GGML_ASSERT(model);
+    server_memory_collector collector;
+    const auto owner = collector.owner(model.get(), "model", "main");
+    GGML_ASSERT(llama_model_visit_buffers(model.get(), [&](const llama_memory_buffer_view & view) { collector.buffer(owner, view); }));
+    GGML_ASSERT(llama_model_visit_placement(model.get(), [&](const llama_memory_placement_view & view) { collector.placement(owner, view); }));
+    const auto report = collector.finish();
+    GGML_ASSERT(report["status"] == "known" && report["placement"]["status"] == "known");
+    std::set<int> cpu_layers, gpu_layers;
+    bool input = false, output = false;
+    for (const auto & group : report["placement"]["layer_groups"]) {
+        GGML_ASSERT(group["assignment"]["status"] == "known");
+        if (group["component"] == "repeating_layers") {
+            auto & layers = group["location"] == "cpu" ? cpu_layers : gpu_layers;
+            for (const auto & layer : group["layer_indices"]) { GGML_ASSERT(layers.insert(layer.get<int>()).second); }
+        } else if (group["component"] == "input_weights") {
+            input = group["location"] == "cpu";
+        } else if (group["component"] == "output_weights") {
+            output = group["location"] == "accelerator";
+        }
+    }
+    GGML_ASSERT(input && output && cpu_layers.size() == 21 && gpu_layers.size() == 19);
+    for (int layer = 0; layer < 40; ++layer) { GGML_ASSERT((layer < 21 ? cpu_layers : gpu_layers).count(layer)); }
+}
+#endif
 
 static llama_context_ptr context(llama_model * model, bool embeddings = false) {
     auto params = llama_context_default_params();
@@ -449,7 +574,7 @@ static void test_tied_output(const char * path) {
     }));
     GGML_ASSERT(output_roles >= 2); // output norm and the aliased embedding weight
     model.reset();
-    test_assignments(tied_path.c_str());
+    test_assignments(tied_path.c_str(), true);
     GGML_ASSERT(std::remove(tied_path.c_str()) == 0);
 }
 
@@ -623,6 +748,9 @@ int main(int argc, char ** argv) {
         test_model(arch, argv[1]);
     }
     test_missing_placement();
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+    test_partial_assignment_report();
+#endif
     {
         auto data = metadata("qwen35");
         gguf_set_val_u32(data.get(), "qwen35.block_count", 3);
