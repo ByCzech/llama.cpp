@@ -44,6 +44,7 @@ struct llama_memory_placement_view {
     ggml_backend_buffer_t buffer; // borrowed; NULL if no buffer is known
     bool known; // both the role and the actual buffer are known
     llama_memory_tensor_assignment assignment = {}; // device is NULL when the final assignment cannot be proved
+    const ggml_tensor * tensor = nullptr; // borrowed metadata; NULL for an unknown layer with no tensor
 };
 
 using llama_memory_placement_visitor = std::function<void(const llama_memory_placement_view &)>;

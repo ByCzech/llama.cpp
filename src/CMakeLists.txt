@@ -29,6 +29,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsv4.cpp
     llama-memory.cpp
     llama-memory-placement.cpp
+    llama-memory-weight-storage.cpp
     llama-moe-cache.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp

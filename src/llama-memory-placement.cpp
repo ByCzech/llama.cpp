@@ -50,7 +50,7 @@ bool llama_memory_visit_tensor_roles(
                 assignment.device = nullptr;
             }
         }
-        visitor({role.part, role.layer, buffer, buffer != nullptr, assignment});
+        visitor({role.part, role.layer, buffer, buffer != nullptr, assignment, role.tensor});
         complete = buffer != nullptr && complete;
         classified.insert(role.tensor);
         if (role.layer >= 0) {
@@ -59,7 +59,7 @@ bool llama_memory_visit_tensor_roles(
     }
     for (const auto & tensor : tensors) {
         if (classified.count(tensor.second) == 0) {
-            visitor({LLAMA_MEMORY_MODEL_PART_OTHER, -1, llama_memory_tensor_buffer(tensor.second), false});
+            visitor({LLAMA_MEMORY_MODEL_PART_OTHER, -1, llama_memory_tensor_buffer(tensor.second), false, {}, tensor.second});
             complete = false;
         }
     }

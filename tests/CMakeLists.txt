@@ -386,6 +386,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     add_executable(test-memory-buffers test-memory-buffers.cpp)
     target_link_libraries(test-memory-buffers PRIVATE llama)
     llama_test(test-memory-buffers ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-memory-buffers.gguf)
+
+    add_executable(test-memory-weight-storage test-memory-weight-storage.cpp)
+    target_link_libraries(test-memory-weight-storage PRIVATE llama)
+    llama_test(test-memory-weight-storage)
     if (LLAMA_BUILD_MTMD OR LLAMA_BUILD_TOOLS)
         find_package(Threads REQUIRED)
         add_library(test-memory-report-support STATIC
