@@ -94,9 +94,10 @@ def worker(*args):
 
 
 def validate(report):
-    assert set(report) == {"schema_version", "runtime_fingerprint", "scope", "precision",
+    required = {"schema_version", "runtime_fingerprint", "scope", "precision",
                            "status", "missing_components", "model_state", "snapshot_sequence",
                            "snapshot_stage", "snapshot_age_ms", "owners", "devices", "buffers", "placement", "allocation_locality"}
+    assert required <= set(report) <= required | {"weight_storage"}
     assert type(report["schema_version"]) is int and report["schema_version"] == 1
     assert report["scope"] == "backend_buffers" and report["precision"] == "exact_bytes"
     assert report["runtime_fingerprint"].startswith("b")
@@ -152,6 +153,57 @@ def validate(report):
     for item in locality["missing_components"]:
         assert item["buffer_id"] is None or item["buffer_id"] in buffers
 
+    if "weight_storage" in report:
+        weights = report["weight_storage"]
+        assert set(weights) == {"scope", "deduplication", "status", "missing_components", "intervals"}
+        assert weights["scope"] == "model_weights" and weights["deduplication"] == "buffer_ranges"
+        assert weights["status"] in ("known", "partial", "unavailable")
+        assert (weights["status"] == "known") == (not weights["missing_components"])
+        models = {item["id"] for item in report["owners"] if item["kind"] == "model"}
+        descriptions = {item["id"]: item for item in report["buffers"]}
+        ids, ends = set(), {}
+        components = {"input_weights", "output_weights", "repeating_layers", "mtp_layers", "other_weights"}
+        for interval in weights["intervals"]:
+            assert set(interval) == {"id", "buffer_id", "offset_bytes", "size_bytes", "assignment", "relationships"}
+            assert interval["id"] not in ids
+            ids.add(interval["id"])
+            buffer_id = interval["buffer_id"]
+            assert buffer_id in buffers
+            offset, size = interval["offset_bytes"], interval["size_bytes"]
+            assert type(offset) is int and type(size) is int and offset >= 0 and size > 0
+            assert offset + size <= 2**64 - 1
+            assert offset >= ends.get(buffer_id, 0)
+            ends[buffer_id] = offset + size
+            assert descriptions[buffer_id]["size_bytes"] is not None
+            assert offset + size <= descriptions[buffer_id]["size_bytes"]
+            evidence = interval["assignment"]
+            assert set(evidence) == {"status", "device_ids", "sources", "reasons"}
+            assert evidence["status"] in ("known", "partial", "unavailable")
+            assert set(evidence["device_ids"]) <= devices
+            assert evidence["status"] != "known" or (len(evidence["device_ids"]) == 1 and not evidence["reasons"])
+            assert interval["relationships"]
+            relations = set()
+            for relation in interval["relationships"]:
+                assert set(relation) == {"owner_id", "component", "layer_index"}
+                assert relation["owner_id"] in models and relation["component"] in components
+                layer = relation["layer_index"]
+                assert layer is None or (type(layer) is int and layer >= 0)
+                key = relation["owner_id"], relation["component"], layer
+                assert key not in relations
+                relations.add(key)
+                assert any(item["owner_id"] == relation["owner_id"] and item["component"] == "model_weights"
+                           for item in descriptions[buffer_id]["owners"])
+        failures = set()
+        for missing in weights["missing_components"]:
+            assert set(missing) == {"owner_id", "component", "layer_index", "reason"}
+            assert missing["owner_id"] is None or missing["owner_id"] in models
+            layer = missing["layer_index"]
+            assert layer is None or (type(layer) is int and layer >= 0)
+            key = missing["owner_id"], missing["component"], layer, missing["reason"]
+            assert key not in failures
+            failures.add(key)
+        assert weights["status"] != "unavailable" or not weights["intervals"]
+
 
 def test_loaded_auth_and_stream(server, model, directory, mmap):
     options = ["--load-mode", "mmap" if mmap else "none"]
@@ -164,6 +216,8 @@ def test_loaded_auth_and_stream(server, model, directory, mmap):
         assert initial["model_state"] == "loaded"
         assert initial["snapshot_stage"] == "after_load"
         assert initial["placement"]["status"] == "known", initial["placement"]
+        assert initial["weight_storage"]["status"] == "known", initial["weight_storage"]
+        assert initial["weight_storage"]["intervals"]
         cpu_devices = {item["id"] for item in initial["devices"] if item["type"] == "cpu"}
         for group in initial["placement"]["layer_groups"]:
             assert group["assignment"]["status"] == "known"
@@ -197,6 +251,7 @@ def test_loaded_auth_and_stream(server, model, directory, mmap):
                 current = instance.report()
                 assert current["snapshot_sequence"] >= initial["snapshot_sequence"]
                 assert current["model_state"] == "loaded"
+                assert current["weight_storage"] == initial["weight_storage"]
         finally:
             stream.close()
         def completed():
@@ -204,6 +259,7 @@ def test_loaded_auth_and_stream(server, model, directory, mmap):
             return report if report["snapshot_stage"] == "after_request" else None
         final = instance.wait(completed)
         assert final["snapshot_sequence"] > initial["snapshot_sequence"]
+        assert final["weight_storage"] == initial["weight_storage"]
         print("loaded/auth/stream/after_request", "mmap" if mmap else "allocated", "PASSED")
 
 
@@ -217,6 +273,7 @@ def test_sleep(server, model, directory):
         assert saved["status"] == "known" and saved["buffers"] == []
         assert saved["allocation_locality"]["status"] == "known"
         assert saved["allocation_locality"]["allocations"] == saved["allocation_locality"]["bindings"] == []
+        assert saved["weight_storage"]["status"] == "known" and saved["weight_storage"]["intervals"] == []
         assert saved["snapshot_stage"] == "after_unload"
         assert saved["snapshot_sequence"] > before["snapshot_sequence"]
         assert instance.report()["snapshot_sequence"] == saved["snapshot_sequence"]
@@ -225,6 +282,7 @@ def test_sleep(server, model, directory):
         after = instance.report()
         assert after["model_state"] == "loaded" and after["buffers"]
         assert after["snapshot_sequence"] > saved["snapshot_sequence"]
+        assert after["weight_storage"] == before["weight_storage"]
         print("sleep/read-without-wake/reload PASSED")
 
 

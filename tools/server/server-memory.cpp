@@ -75,6 +75,40 @@ const char * backing_name(llama_memory_backing backing) {
     return "unknown";
 }
 
+struct assignment_evidence {
+    ggml_backend_dev_t device = nullptr;
+    const char * source = nullptr;
+    const char * reason = nullptr;
+};
+
+assignment_evidence resolve_assignment(const llama_memory_placement_view & view, ggml_backend_dev_t native) {
+    assignment_evidence result;
+    const auto & assignment = view.assignment;
+    result.source = assignment_source(assignment.source);
+    if (!view.known || !view.buffer) {
+        result.reason = "tensor_unclassified";
+    } else if ((ggml_backend_memory_buffer_flags(view.buffer) & GGML_BACKEND_MEMORY_BUFFER_OPAQUE) ||
+               (native && ggml_backend_dev_type(native) == GGML_BACKEND_DEVICE_TYPE_META)) {
+        result.reason = "opaque_distribution";
+    } else if (assignment.source != LLAMA_MEMORY_ASSIGNMENT_UNKNOWN) {
+        // A failed or invalidated loader decision must not become a buffer-based guess.
+        result.device = result.source ? assignment.device : nullptr;
+        if (!result.device) { result.reason = "assignment_unknown"; }
+    } else if (!native) {
+        result.reason = "device_unknown";
+    } else if (ggml_backend_dev_type(native) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_buffer_is_host(view.buffer)) {
+        result.reason = "opaque_distribution";
+    } else {
+        result.device = native;
+        result.source = "native_buffer";
+    }
+    if (result.device && ggml_backend_dev_type(result.device) == GGML_BACKEND_DEVICE_TYPE_META) {
+        result.device = nullptr;
+        result.reason = "opaque_distribution";
+    }
+    return result;
+}
+
 } // namespace
 
 server_memory_collector::server_memory_collector() {
@@ -199,31 +233,10 @@ void server_memory_collector::placement(size_t owner_index, const llama_memory_p
     for (const auto & id : device(native)) {
         current.devices.insert(id.get<std::string>());
     }
-    const auto & assignment = view.assignment;
-    const char * source = assignment_source(assignment.source);
-    ggml_backend_dev_t assigned = nullptr;
-    const char * reason = nullptr;
-    if (!view.known || !view.buffer) {
-        reason = "tensor_unclassified";
-    } else if ((ggml_backend_memory_buffer_flags(view.buffer) & GGML_BACKEND_MEMORY_BUFFER_OPAQUE) ||
-               (native && ggml_backend_dev_type(native) == GGML_BACKEND_DEVICE_TYPE_META)) {
-        reason = "opaque_distribution";
-    } else if (assignment.source != LLAMA_MEMORY_ASSIGNMENT_UNKNOWN) {
-        // A failed or invalidated loader decision must not become a buffer-based guess.
-        assigned = source ? assignment.device : nullptr;
-        if (!assigned) { reason = "assignment_unknown"; }
-    } else if (!native) {
-        reason = "device_unknown";
-    } else if (ggml_backend_dev_type(native) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_buffer_is_host(view.buffer)) {
-        reason = "opaque_distribution";
-    } else {
-        assigned = native;
-        source = "native_buffer";
-    }
-    if (assigned && ggml_backend_dev_type(assigned) == GGML_BACKEND_DEVICE_TYPE_META) {
-        assigned = nullptr;
-        reason = "opaque_distribution";
-    }
+    const auto evidence = resolve_assignment(view, native);
+    auto * assigned = evidence.device;
+    const auto * source = evidence.source;
+    const auto * reason = evidence.reason;
     if (source) { current.sources.insert(source); }
     if (assigned) {
         for (const auto & id : device(assigned)) { current.assigned_devices.insert(id.get<std::string>()); }
@@ -241,9 +254,52 @@ void server_memory_collector::placement(size_t owner_index, const llama_memory_p
     }
 }
 
+void server_memory_collector::weight_missing(size_t owner_index, const char * component, int32_t layer, const char * reason) {
+    if (owner_index != no_owner) { weight_visited.insert(owner_index); }
+    json relationship = {{"owner_id", owner_index == no_owner ? json() : data["owners"][owner_index]["id"]},
+        {"component", component}, {"layer_index", layer < 0 ? json() : json(layer)}};
+    weights.missing(relationship, reason);
+}
+
+void server_memory_collector::weight_storage(size_t owner_index, const llama_memory_weight_storage_view & view) {
+    weight_visited.insert(owner_index);
+    const auto & placement = view.placement;
+    const auto * component = part_name(placement.part);
+    if (!placement.known) {
+        weight_missing(owner_index, component, placement.layer, view.missing_reason ? view.missing_reason : "tensor_unclassified");
+        return;
+    }
+    if (view.missing_reason) {
+        weight_missing(owner_index, component, placement.layer, view.missing_reason);
+        return;
+    }
+    const auto found = buffer_indices.find(placement.buffer);
+    if (found == buffer_indices.end()) {
+        weight_missing(owner_index, component, placement.layer, "buffer_not_in_inventory");
+        return;
+    }
+    auto * native = ggml_backend_memory_buffer_device(placement.buffer);
+    const auto evidence = resolve_assignment(placement, native);
+    const json relationship = {{"owner_id", data["owners"][owner_index]["id"]}, {"component", component},
+        {"layer_index", placement.layer < 0 ? json() : json(placement.layer)}};
+    const json assignment = {{"status", evidence.reason ? "unavailable" : "known"},
+        {"device_ids", device(evidence.device)},
+        {"sources", evidence.source ? json::array({evidence.source}) : json::array()},
+        {"reasons", evidence.reason ? json::array({evidence.reason}) : json::array()}};
+    weights.tensor(data["buffers"][found->second], view, relationship, assignment);
+}
+
 json server_memory_collector::finish() const {
     json result = data;
     result["allocation_locality"] = locality.finish();
+    auto captured_weights = weights;
+    for (size_t i = 0; i < data["owners"].size(); ++i) {
+        if (data["owners"][i]["kind"] == "model" && !weight_visited.count(i)) {
+            captured_weights.missing({{"owner_id", data["owners"][i]["id"]}, {"component", "model_weights"},
+                {"layer_index", json()}}, "tensor_storage_unavailable");
+        }
+    }
+    result["weight_storage"] = captured_weights.finish();
     result["status"] = data["missing_components"].empty() ? "known" : usable ? "partial" : "unavailable";
     auto & placement = result["placement"];
     placement["status"] = placement["missing_components"].empty() ? "known" : placement_usable ? "partial" : "unavailable";
@@ -294,16 +350,19 @@ json server_memory_native::capture(const server_memory_sources & sources) {
         server_memory_collector empty;
         empty.missing(no_owner, "inventory", "transition_in_progress");
         empty.missing(no_owner, "inventory", "transition_in_progress", true);
+        empty.weight_missing(no_owner, "model_weights", -1, "transition_in_progress");
         return empty.finish();
     }
     if (!base || cached.main != sources.main || cached.draft != sources.draft || cached.draft_is_mtp != sources.draft_is_mtp) {
         reset();
         auto next = std::make_unique<server_memory_collector>();
+        std::set<const llama_model *> inspected_models;
         auto add_model = [&](const llama_context * ctx, const char * role) {
             if (!ctx) { return; }
             const auto * model = llama_get_model(ctx);
             const size_t owner = next->owner(model, "model", role);
             next->owner(ctx, "context", role);
+            if (!inspected_models.insert(model).second) { return; }
             try {
                 if (!llama_model_visit_buffers(model, [&](const llama_memory_buffer_view & view) { next->buffer(owner, view); })) {
                     next->missing(owner, "model_weights", "collector_not_implemented");
@@ -314,6 +373,14 @@ json server_memory_native::capture(const server_memory_sources & sources) {
                     next->missing(owner, "model_weights", "tensor_unclassified", true);
                 }
             } catch (const std::exception &) { next->missing(owner, "model_weights", "collection_failed", true); }
+            try {
+                bool visited = false;
+                const bool complete = llama_model_visit_weight_storage(model, [&](const llama_memory_weight_storage_view & view) {
+                    visited = true;
+                    next->weight_storage(owner, view);
+                });
+                if (!complete && !visited) { next->weight_missing(owner, "model_weights", -1, "tensor_storage_unavailable"); }
+            } catch (const std::exception &) { next->weight_missing(owner, "model_weights", -1, "collection_failed"); }
         };
         add_model(sources.main, "main");
         add_model(sources.draft, sources.draft_is_mtp ? "mtp" : "draft");

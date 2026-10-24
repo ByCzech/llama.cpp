@@ -2,6 +2,7 @@
 
 #include "json.h"
 #include "server-memory-locality.h"
+#include "server-memory-weights.h"
 #include "../../src/llama-memory-placement.h"
 
 #include <map>
@@ -29,6 +30,8 @@ public:
     size_t owner(const void * identity, const char * kind, const char * role);
     void buffer(size_t owner_index, const llama_memory_buffer_view & view);
     void placement(size_t owner_index, const llama_memory_placement_view & view);
+    void weight_storage(size_t owner_index, const llama_memory_weight_storage_view & view);
+    void weight_missing(size_t owner_index, const char * component, int32_t layer, const char * reason);
     void missing(size_t owner_index, const char * component, const char * reason, bool placement = false);
     void known_source();
     json finish() const;
@@ -45,8 +48,10 @@ private:
     };
     json data;
     server_memory_locality locality;
+    server_memory_weights weights;
     bool usable = false;
     bool placement_usable = false;
+    std::set<size_t> weight_visited;
     std::map<std::string, std::map<const void *, size_t>> owner_indices;
     std::map<ggml_backend_dev_t, size_t> device_indices;
     std::map<ggml_backend_buffer_t, size_t> buffer_indices;

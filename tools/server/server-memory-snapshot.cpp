@@ -30,6 +30,7 @@ void server_memory_reporter::transition(const char * model_state, const char * s
         const auto no_owner = std::numeric_limits<size_t>::max();
         empty.missing(no_owner, "inventory", reason);
         empty.missing(no_owner, "inventory", reason, true);
+        empty.weight_missing(no_owner, "model_weights", -1, reason);
     }
     publish(empty.finish(), model_state, stage);
 }

@@ -70,6 +70,28 @@ static void check_report(server_memory_native & collector, const server_memory_s
     const auto report = collector.capture(sources);
     GGML_ASSERT(report["status"] == "known");
     GGML_ASSERT(report["placement"]["status"] == "known");
+    GGML_ASSERT(report["weight_storage"]["status"] == "known");
+    std::set<const llama_model *> models = {llama_get_model(sources.main)};
+    if (sources.draft) { models.insert(llama_get_model(sources.draft)); }
+    // A byte-set oracle over these small real CPU fixtures, independent of the interval sweep.
+    std::map<ggml_backend_buffer_t, std::vector<bool>> payload;
+    for (const auto * model : models) {
+        GGML_ASSERT(llama_model_visit_weight_storage(model, [&](const llama_memory_weight_storage_view & view) {
+            auto & used = payload[view.placement.buffer];
+            used.resize(ggml_backend_buffer_get_size(view.placement.buffer), false);
+            for (const auto range : view.ranges) {
+                for (size_t i = range.offset; i < range.offset + range.size; ++i) { used[i] = true; }
+            }
+        }));
+    }
+    size_t expected_payload = 0, actual_payload = 0;
+    for (const auto & entry : payload) {
+        for (const bool used : entry.second) { expected_payload += used; }
+    }
+    for (const auto & interval : report["weight_storage"]["intervals"]) {
+        actual_payload += interval["size_bytes"].get<size_t>();
+    }
+    GGML_ASSERT(actual_payload == expected_payload && actual_payload > 0);
     GGML_ASSERT(report["buffers"].size() == native.size());
     uint64_t actual = 0;
     size_t mapped_buffers = 0, model_owners = 0;
@@ -81,10 +103,10 @@ static void check_report(server_memory_native & collector, const server_memory_s
     for (const auto & owner : report["owners"]) {
         if (owner["kind"] == "model") {
             ++model_owners;
-            GGML_ASSERT(owner["roles"].size() == (sources.draft ? 2 : 1));
+            GGML_ASSERT(owner["roles"].size() == (sources.draft && models.size() == 1 ? 2 : 1));
         }
     }
-    GGML_ASSERT(model_owners == 1); // both test contexts share their actual model
+    GGML_ASSERT(model_owners == models.size());
     GGML_ASSERT(actual == expected);
     GGML_ASSERT((mapped_buffers > 0) == mapped);
 }
@@ -507,15 +529,22 @@ cpu_allocation_fixture * cpu_allocation_fixture::active = nullptr;
 static void test_locality_native_lifecycle() {
     cpu_allocation_fixture fixture;
     server_memory_reporter reporter("fixture-locality");
+    size_t previous_payload = 0;
     for (int generation = 1; generation <= 2; ++generation) {
         fixture.generation = generation;
         auto data = metadata("llama");
+        gguf_set_val_u32(data.get(), "llama.block_count", generation + 1);
         std::set<ggml_backend_buffer_t> initialized;
         llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, model_params()));
         GGML_ASSERT(model);
         auto ctx = context(model.get());
         reporter.capture({ctx.get()}, "after_load");
         const auto first = reporter.read();
+        GGML_ASSERT(first["weight_storage"]["status"] == "known");
+        size_t payload = 0;
+        for (const auto & interval : first["weight_storage"]["intervals"]) { payload += interval["size_bytes"].get<size_t>(); }
+        GGML_ASSERT(payload > previous_payload);
+        previous_payload = payload;
         GGML_ASSERT(first["allocation_locality"]["status"] == "known");
         GGML_ASSERT(!first["allocation_locality"]["allocations"].empty());
         for (const auto & allocation : first["allocation_locality"]["allocations"]) {
@@ -528,6 +557,7 @@ static void test_locality_native_lifecycle() {
             reporter.capture({ctx.get()}, "after_batch", false);
             const auto refreshed = reporter.read();
             GGML_ASSERT(refreshed["buffers"] == first["buffers"]);
+            GGML_ASSERT(refreshed["weight_storage"] == first["weight_storage"]);
             GGML_ASSERT(refreshed["snapshot_sequence"].get<uint64_t>() > first["snapshot_sequence"].get<uint64_t>());
             bool cached_weights = false, fresh_context = false;
             for (const auto & allocation : refreshed["allocation_locality"]["allocations"]) {
@@ -536,12 +566,20 @@ static void test_locality_native_lifecycle() {
             }
             GGML_ASSERT(cached_weights && fresh_context);
         }
+        if (generation == 1) {
+            reporter.transition("loading", "before_load");
+            reporter.transition("failed", "after_load_failure");
+            const auto failed = reporter.read()["weight_storage"];
+            GGML_ASSERT(failed["status"] == "unavailable" && failed["intervals"].empty());
+        }
         reporter.transition("unloading", "before_unload");
+        GGML_ASSERT(reporter.read()["weight_storage"]["intervals"].empty());
         ctx.reset();
         model.reset();
         reporter.transition("sleeping", "after_unload", true);
         const auto empty = reporter.read()["allocation_locality"];
         GGML_ASSERT(empty["status"] == "known" && empty["allocations"].empty() && empty["bindings"].empty());
+        GGML_ASSERT(reporter.read()["weight_storage"]["status"] == "known" && reporter.read()["weight_storage"]["intervals"].empty());
     }
 }
 #endif
@@ -784,6 +822,16 @@ static void test_model(const std::string & arch, const char * model_path) {
         for (const auto & entry : shared_weights) {
             GGML_ASSERT(initialized.count(entry.first) == 1);
         }
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+        {
+            std::set<ggml_backend_buffer_t> draft_initialized;
+            llama_model_ptr draft_model(llama_model_init_from_user(data.get(), initialize_tensor, &draft_initialized, model_params()));
+            GGML_ASSERT(draft_model);
+            auto draft_ctx = context(draft_model.get());
+            check_report(collector, {ctx.get(), draft_ctx.get()});
+            collector.reset();
+        }
+#endif
 
         llama_memory_clear(llama_get_memory(ctx.get()), true);
         auto batch = llama_batch_init(8, 0, 1);
@@ -892,6 +940,13 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(model);
         check_placement(model.get(), 2, true);
         check_weight_storage(model.get());
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+        auto main_ctx = context(model.get());
+        auto mtp_ctx = context(model.get());
+        server_memory_native collector;
+        check_report(collector, {main_ctx.get(), mtp_ctx.get(), nullptr, true});
+        collector.reset();
+#endif
         std::puts("memory placement: MTP PASSED");
     }
     llama_backend_free();

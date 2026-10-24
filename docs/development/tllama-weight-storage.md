@@ -1,8 +1,8 @@
 # Model weight storage accounting
 
-## Implementation stages
+## Capture and ranges
 
-The first stage adds a private owner-thread visitor in `src/llama-memory-weight-storage.h`. It does not add a JSON section or change existing `/tllama/memory` fields. Buffer capacities and mmap spans retain their current meaning. The collector and interval deduplication are a subsequent change.
+The private owner-thread visitor is in `src/llama-memory-weight-storage.h`. The server collector publishes its deduplicated ranges in the optional `weight_storage` section of `/tllama/memory`. Existing fields, buffer capacities and mmap spans retain their current meaning.
 
 The visitor preserves the tensor identity, model part, native layer, buffer and checked loader assignment from placement inspection. It emits exact, sorted, disjoint byte ranges relative to that buffer. Padding and holes between strided rows are excluded. Quantized dimensions use storage blocks, including their scale/format bytes. Dense and transposed layouts do not require an element scan. A fragmented layout exceeding 4096 intermediate ranges is unavailable with `tensor_range_limit`; it never falls back to a dense span.
 
@@ -16,9 +16,9 @@ The resolver checks view chains, buffer association, quantization block shape, a
 
 Callbacks borrow tensor/buffer metadata at a safe point on the owner thread. They must not retain pointers beyond the capture or export addresses. Tensor data, backend allocation inspection and SDK queries are not used. The HTTP handler must continue to read an immutable snapshot rather than invoke this visitor.
 
-## Planned additive JSON contract
+## Additive JSON contract
 
-This section defines the intended collector contract; it is not yet emitted by this first-stage patch.
+New native snapshots include this section; it remains optional for clients reading older V1 runtimes.
 
 - Keep schema version 1 and all existing buffer/placement/locality meanings. Add optional `weight_storage` with independent status, scope and `missing_components`. Absence means unsupported, never zero bytes.
 - Initial scope is `model_weights`: main model, independently loaded draft model, and a model shared by main/MTP. Projector, LoRA, context state and MoE runtime cache/replicas are outside this scope. The inventory continues to describe them independently.
@@ -29,7 +29,7 @@ This section defines the intended collector contract; it is not yet emitted by t
 - Deduplication across different buffer objects needs separate, explicit storage evidence. Do not infer it from allocation locality, pointer equality across devices, names, contents or host visibility.
 - Cache static model metadata at the existing safe capture point. Reset it before owner destruction/replacement, including sleep, reload and failed load. IDs and intervals must not be joined across snapshots.
 
-The collector contract uses this shape (example only; not emitted by this patch):
+The collector uses this shape (IDs and numbers below are illustrative):
 
 ```json
 {
@@ -63,16 +63,20 @@ The collector contract uses this shape (example only; not emitted by this patch)
 
 Each missing-component record contains `owner_id` (nullable), `component`, `layer_index` (nullable), and `reason`. For example, a layer with an opaque storage mapping has a concrete native layer and `opaque_tensor_storage`; model inspection unavailable before load has a model-level reason. Known status requires complete storage, roles and assignment in scope, with no missing components. Partial retains proved intervals with explicit gaps in coverage. Unavailable has no usable storage evidence and an explicit reason; a proved unloaded state is known with an empty interval list. Assignment conflicts over one interval must remain explicit and cannot yield two copies of that interval. `deduplication = buffer_ranges` deliberately makes no claim about physical aliasing between buffer objects.
 
-The collector patch must update the native HTTP test that currently asserts an exact top-level key set and qualify this shape against the client. Old schema-V1 responses remain valid. The client needs a separate adapter change to validate/use the new section and to avoid adding model buffer capacities to the same payload again. An unknown-field-tolerant reader alone does not use the new accounting.
+Unclassified tensors, missing buffer references and unavailable layouts produce missing-component records rather than invented relationships or byte counts. Exact geometry with an unknown assignment can remain in `intervals` with an explicit unavailable/partial assignment. Overlapping contradictory device assignments clear the interval's device IDs, add `assignment_conflict` and mark coverage partial. They never produce two copies of the same interval. A model owner whose weights were not inspected is unavailable, not a known empty model.
+
+Static weight metadata is captured with the model inventory. A model shared by main/MTP is visited once while its owner keeps both roles. The interval sweep is cached; collector copies share this value state until a write. The state contains copied IDs, relationships and ranges, not live tensor pointers. Owner-thread reset before destruction invalidates it for unloading, sleeping, failed load and replacement. The immutable HTTP snapshot is independent of the inference task queue. An empty proved unloaded state has known coverage and no intervals; transitions and failures have unavailable coverage with a reason.
+
+Old schema-V1 responses remain valid. The native HTTP test accepts the section as optional and validates its interval bounds and references when present. The client needs a separate adapter change to validate/use the new section and to avoid adding model buffer capacities to the same payload again. An unknown-field-tolerant reader alone does not use the new accounting.
 
 ## Compatibility audit
 
 The TLlama reader at `a7cf2e970e4999a6c0fd28293fd2ad1329969732` explicitly ignores unknown fields in `_record()` and only recognizes current extensions in `_extensions()`. Its existing `test_v1_additions_are_ignored_and_new_role_component_reason_names_survive` covers this behavior. An optional top-level `weight_storage` is compatible with that reader, but is discarded until the dependent client update. `_native_memory_sizes()` still uses buffer totals for mixed placement at that revision.
 
-This audit does not authorize changing the TLlama repository in this native patch. Before rollout, test the finalized new section with both the old reader and the updated adapter, including absent, partial and unavailable sections.
+This native patch does not change the TLlama repository. The old reader is checked against native output; before rollout the updated adapter also needs tests for absent, partial and unavailable sections. No supported fingerprint should be added solely from the presence of this optional section.
 
 ## Validation
 
 The range tests use synthetic buffer-relative addresses and do not allocate or read the declared storage. They cover distant 1 MiB tensors in a 1 GiB span, quantized/strided/transposed/overlapping layouts, views, independent placement coverage, matching addresses in distinct buffers, opaque buffers, overflow and bounded enumeration. An independent byte-set oracle checks small randomized layouts.
 
-Real CPU loader tests cover exact payload ranges for generated models, mmap on/off parity, tied input/output roles, MTP and no-alloc inspection. These tests do not establish hardware qualification for GPU backends, full cross-tensor interval deduplication, or the P100 mixed-placement case. Those remain required in subsequent stages.
+Collector tests cover the 1 GiB sparse span, byte-accurate role boundaries, shared owners, separate copies, conflicting/unknown assignments, invalid ranges and copy-on-write cache isolation. A second independent byte-set oracle checks randomized role overlaps. Real CPU loader tests cover mmap on/off, an independent draft, shared main/MTP owners and replacement with a different-size model. HTTP tests cover streaming reads and sleep/reload. Reporter tests cover failure after a previous snapshot, weight-only changes and concurrent snapshot reads. These tests do not establish GPU hardware qualification or explain the real P100 mixed-placement case; those remain required before release.

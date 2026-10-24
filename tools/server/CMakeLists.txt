@@ -28,6 +28,8 @@ add_library(${TARGET} STATIC
     server-memory.cpp
     server-memory-locality.cpp
     server-memory-locality.h
+    server-memory-weights.cpp
+    server-memory-weights.h
     server-memory.h
     server-memory-snapshot.cpp
     server-memory-snapshot.h

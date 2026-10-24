@@ -14,7 +14,8 @@ static void test_lifecycle() {
     auto inventory = empty.finish();
     reporter.publish(inventory, "loaded", "after_load");
     auto first = reporter.read();
-    GGML_ASSERT(first.size() == 15);
+    GGML_ASSERT(first.size() == 16);
+    GGML_ASSERT(first["weight_storage"]["status"] == "known" && first["weight_storage"]["intervals"].empty());
     GGML_ASSERT(first["allocation_locality"]["status"] == "known");
     GGML_ASSERT(first["schema_version"].get<int>() == 1);
     GGML_ASSERT(first["runtime_fingerprint"] == llama_build_info());
@@ -36,6 +37,7 @@ static void test_lifecycle() {
     const auto unloading = reporter.read();
     GGML_ASSERT(unloading["status"] == "unavailable");
     GGML_ASSERT(unloading["buffers"].empty());
+    GGML_ASSERT(unloading["weight_storage"]["status"] == "unavailable" && unloading["weight_storage"]["intervals"].empty());
     GGML_ASSERT(unloading["snapshot_sequence"].get<uint64_t>() == 3);
     reporter.transition("sleeping", "after_unload", true);
     const auto sleeping = reporter.read();
@@ -44,16 +46,19 @@ static void test_lifecycle() {
     GGML_ASSERT(sleeping["buffers"].empty());
     GGML_ASSERT(sleeping["allocation_locality"]["status"] == "known");
     GGML_ASSERT(sleeping["allocation_locality"]["allocations"].empty());
+    GGML_ASSERT(sleeping["weight_storage"]["status"] == "known" && sleeping["weight_storage"]["intervals"].empty());
     GGML_ASSERT(sleeping["snapshot_sequence"].get<uint64_t>() == 4);
     const auto age = sleeping["snapshot_age_ms"].get<uint64_t>();
     GGML_ASSERT(reporter.read()["snapshot_age_ms"].get<uint64_t>() >= age);
     reporter.transition("failed", "after_load_failure");
     GGML_ASSERT(reporter.read()["status"] == "unavailable");
+    GGML_ASSERT(reporter.read()["weight_storage"]["status"] == "unavailable");
     reporter.transition("loaded", "after_batch", false, "collection_failed");
     const auto failed_collection = reporter.read();
     GGML_ASSERT(failed_collection["status"] == "unavailable");
     GGML_ASSERT(failed_collection["buffers"].empty());
     GGML_ASSERT(failed_collection["missing_components"][0]["reason"] == "collection_failed");
+    GGML_ASSERT(failed_collection["weight_storage"]["missing_components"][0]["reason"] == "collection_failed");
 }
 
 static void test_concurrent_reads() {
@@ -67,6 +72,7 @@ static void test_concurrent_reads() {
         auto inventory = empty.finish();
         inventory["buffers"].push_back({{"id", "b1"}, {"size_bytes", uint64_t(1)}});
         inventory["allocation_locality"]["allocations"].push_back({{"id", "a1"}, {"size_bytes", uint64_t(1)}});
+        inventory["weight_storage"]["intervals"].push_back({{"id", "w1"}, {"size_bytes", uint64_t(1)}});
         reporter.publish(inventory, "loaded", "after_load");
         {
             std::unique_lock<std::mutex> lock(mutex);
@@ -78,6 +84,7 @@ static void test_concurrent_reads() {
         for (uint64_t i = 2; i <= 200; ++i) {
             inventory["buffers"][0]["size_bytes"] = i;
             inventory["allocation_locality"]["allocations"][0]["size_bytes"] = i;
+            inventory["weight_storage"]["intervals"][0]["size_bytes"] = i;
             reporter.publish(inventory, "loaded", "after_batch", false);
         }
         finished.store(true);
@@ -99,6 +106,7 @@ static void test_concurrent_reads() {
         GGML_ASSERT(sequence >= previous);
         GGML_ASSERT(sequence == report["buffers"][0]["size_bytes"].get<uint64_t>());
         GGML_ASSERT(sequence == report["allocation_locality"]["allocations"][0]["size_bytes"].get<uint64_t>());
+        GGML_ASSERT(sequence == report["weight_storage"]["intervals"][0]["size_bytes"].get<uint64_t>());
         GGML_ASSERT(report["runtime_fingerprint"] == "b-test");
         previous = sequence;
     } while (!finished.load());
@@ -131,9 +139,32 @@ static void test_locality_only_updates() {
     GGML_ASSERT(reporter.read()["snapshot_sequence"] == 5);
 }
 
+static void test_weight_only_updates() {
+    server_memory_reporter reporter("test-weights");
+    server_memory_collector empty;
+    auto inventory = empty.finish();
+    inventory["weight_storage"]["intervals"].push_back({{"id", "w1"}, {"size_bytes", 32}});
+    reporter.publish(inventory, "loaded", "after_load");
+    const auto saved = reporter.read();
+    reporter.publish(inventory, "loaded", "after_batch", false);
+    GGML_ASSERT(reporter.read()["snapshot_sequence"] == 1);
+    inventory["weight_storage"]["intervals"][0]["size_bytes"] = 64;
+    reporter.publish(inventory, "loaded", "after_batch", false);
+    GGML_ASSERT(reporter.read()["snapshot_sequence"] == 2);
+    GGML_ASSERT(saved["weight_storage"]["intervals"][0]["size_bytes"] == 32);
+    reporter.transition("loading", "before_load");
+    reporter.transition("failed", "after_load_failure");
+    const auto failed = reporter.read()["weight_storage"];
+    GGML_ASSERT(failed["status"] == "unavailable" && failed["intervals"].empty());
+    reporter.transition("unloaded", "after_unload", true);
+    GGML_ASSERT(reporter.read()["weight_storage"]["status"] == "known");
+    GGML_ASSERT(reporter.read()["weight_storage"]["intervals"].empty());
+}
+
 int main() {
     test_lifecycle();
     test_concurrent_reads();
     test_locality_only_updates();
+    test_weight_only_updates();
     std::puts("memory snapshots PASSED");
 }

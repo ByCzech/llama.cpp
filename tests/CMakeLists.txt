@@ -395,6 +395,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
         add_library(test-memory-report-support STATIC
             ../tools/server/server-memory.cpp
             ../tools/server/server-memory-locality.cpp
+            ../tools/server/server-memory-weights.cpp
             ../tools/server/server-memory-snapshot.cpp
             ../common/json.cpp)
         target_link_libraries(test-memory-report-support PUBLIC llama mtmd llama-common-base vendor::nlohmann)
@@ -403,6 +404,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
         add_executable(test-memory-report test-memory-report.cpp)
         target_link_libraries(test-memory-report PRIVATE test-memory-report-support Threads::Threads)
         llama_test(test-memory-report)
+        add_executable(test-memory-weight-report test-memory-weight-report.cpp)
+        target_link_libraries(test-memory-weight-report PRIVATE test-memory-report-support)
+        llama_test(test-memory-weight-report)
         set_tests_properties(test-memory-report PROPERTIES TIMEOUT 30)
         add_executable(test-memory-snapshot test-memory-snapshot.cpp)
         target_link_libraries(test-memory-snapshot PRIVATE test-memory-report-support Threads::Threads)
