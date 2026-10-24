@@ -1,5 +1,6 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-backend-memory.h"
 #include "ggml-backend-dl.h"
 #include "ggml-impl.h"
 #include <algorithm>
@@ -493,7 +494,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         std::error_code cwd_ec;
         const fs::path cwd = fs::current_path(cwd_ec);
         if (cwd_ec) {
-            GGML_LOG_DEBUG("%s: current_path() failure, error-message: %s\n", __func__, cwd_ec.message().c_str());
+            GGML_LOG_DEBUG("%s: failed to get current directory: %s\n", __func__, cwd_ec.message().c_str());
         } else {
             search_paths.push_back(cwd);
         }
@@ -506,20 +507,9 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
     std::error_code ec;
 
     for (const auto & search_path : search_paths) {
-        if (!fs::exists(search_path, ec)) {
-            if (ec) {
-                GGML_LOG_DEBUG("%s: posix_stat(%s) failure, error-message: %s\n", __func__, path_str(search_path).c_str(), ec.message().c_str());
-            } else {
-                GGML_LOG_DEBUG("%s: search path %s does not exist\n", __func__, path_str(search_path).c_str());
-            }
-            continue;
-        }
         std::error_code dir_ec;
-        fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied, dir_ec);
-        if (dir_ec) {
-            GGML_LOG_DEBUG("%s: failed to enumerate %s: %s\n", __func__, path_str(search_path).c_str(), dir_ec.message().c_str());
-            continue;
-        }
+        fs::directory_iterator dir_it(search_path, dir_ec);
+
         for (const fs::directory_iterator end; dir_it != end; dir_it.increment(dir_ec)) {
             const auto & entry = *dir_it;
             if (entry.is_regular_file(ec)) {
@@ -549,6 +539,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                     }
                 }
             }
+        }
+
+        if (dir_ec) {
+            GGML_LOG_DEBUG("%s: failed to enumerate %s: %s\n", __func__, path_str(search_path).c_str(), dir_ec.message().c_str());
         }
     }
 
@@ -602,4 +596,55 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     if (backend_path) {
         ggml_backend_load(backend_path);
     }
+}
+
+// TLlama memory inspection. The generic CPU buffer types do not carry a device pointer.
+ggml_backend_dev_t ggml_backend_memory_buffer_device(ggml_backend_buffer_t buffer) {
+    if (!buffer) {
+        return nullptr;
+    }
+    auto * buft = ggml_backend_buffer_get_type(buffer);
+    auto * device = ggml_backend_buft_get_device(buft);
+    if (!device && ggml_backend_cpu_buffer_type_is_generic(buft)) {
+        device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return device;
+}
+
+uint32_t ggml_backend_memory_buffer_flags(ggml_backend_buffer_t buffer) {
+    if (!buffer) {
+        return 0;
+    }
+    if (ggml_backend_buffer_is_meta(buffer)) {
+        return GGML_BACKEND_MEMORY_BUFFER_OPAQUE;
+    }
+    auto * device = ggml_backend_memory_buffer_device(buffer);
+    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    if (!reg) {
+        return 0;
+    }
+    auto inspect = (ggml_backend_memory_buffer_flags_t) ggml_backend_reg_get_proc_address(reg, "tllama_buffer_memory_flags");
+    if (inspect) {
+        return inspect(buffer);
+    }
+    // Old split backends cannot prove that their objects are leaf allocations.
+    return ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type") ? GGML_BACKEND_MEMORY_BUFFER_OPAQUE : 0;
+}
+
+ggml_backend_memory_allocation_status ggml_backend_memory_buffer_allocations(
+        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user_data) {
+    if (!buffer || !callback) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    // A multi-buffer uses its first child's type but has a different context layout.
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    auto * device = ggml_backend_memory_buffer_device(buffer);
+    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+    if (!reg) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    auto inspect = (ggml_backend_memory_buffer_allocations_t) ggml_backend_reg_get_proc_address(reg, "tllama_buffer_memory_allocations_v1");
+    return inspect ? inspect(buffer, callback, user_data) : GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
 }

@@ -38,6 +38,9 @@ extern "C" {
         void * context;
     };
 
+    // Generic CPU and CPU_Mapped types have no device pointer.
+    GGML_API bool ggml_backend_cpu_buffer_type_is_generic(ggml_backend_buffer_type_t buft);
+
     // [TAG_ALLOC_SIZE_EXPAND]
     // returns true for ops that may require additional memory for fleeting data on some backends,
     // i.e. the backend buffer type's get_alloc_size may return more than ggml_nbytes for the output tensor

@@ -124,10 +124,37 @@ static void test_pinned_alias_and_empty() {
     GGML_ASSERT(result.empty());
 }
 
+static void test_existing_host_views() {
+    struct entry {
+        void * base;
+        size_t size;
+        const int * views[3];
+    };
+    char storage[1024];
+    const int first = 1, second = 2;
+    std::vector<entry> entries = {{storage, sizeof(storage), {&first, nullptr, &second}}};
+    std::vector<const int *> views;
+    size_t offset = 0;
+    GGML_ASSERT(ggml_vk_memory_host_views(entries, storage + 32, 128, views, offset));
+    GGML_ASSERT(offset == 32 && views.size() == 2 && views[0] == &first && views[1] == &second);
+    GGML_ASSERT(entries[0].views[1] == nullptr);
+    GGML_ASSERT(!ggml_vk_memory_host_views(entries, storage + 1000, 25, views, offset));
+    GGML_ASSERT(views.empty() && offset == 0);
+    GGML_ASSERT(!ggml_vk_memory_host_views(entries, storage + 32, SIZE_MAX, views, offset));
+    GGML_ASSERT(!ggml_vk_memory_host_views(entries, storage + sizeof(storage), 0, views, offset));
+    entries[0].views[0] = entries[0].views[2] = nullptr;
+    GGML_ASSERT(!ggml_vk_memory_host_views(entries, storage, 128, views, offset));
+    GGML_ASSERT(views.empty());
+    GGML_ASSERT(entries[0].views[0] == nullptr && entries[0].views[1] == nullptr && entries[0].views[2] == nullptr);
+    entries.clear();
+    GGML_ASSERT(!ggml_vk_memory_host_views(entries, storage, 128, views, offset));
+}
+
 int main() {
     ggml_backend_load_all();
     test_retry();
     test_import_and_failure();
     test_pinned_alias_and_empty();
+    test_existing_host_views();
     std::puts("Vulkan memory metadata PASSED");
 }

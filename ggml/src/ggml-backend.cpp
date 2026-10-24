@@ -986,6 +986,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_realloc_callback callback_realloc;
+    void * callback_realloc_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -993,11 +996,13 @@ struct ggml_backend_sched {
 
     int debug;
 
-    // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
+    // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
+    // graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
+    int graph_size;
+    int prev_graph_size;
+
     int debug_realloc;
-    int debug_graph_size;
-    int debug_prev_graph_size;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1650,9 +1655,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
 
-    // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
-    sched->debug_prev_graph_size = sched->debug_graph_size;
-    sched->debug_graph_size = graph_size;
+    // remember the actual graph_size for performing reallocation checks later
+    sched->prev_graph_size = sched->graph_size;
+    sched->graph_size = graph_size;
 
     if (sched->graph.size < graph_size) {
         sched->graph.size = graph_size;
@@ -1789,14 +1794,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
 
+        // a reallocation with an unchanged graph size means that the previous reservation was not sufficient
+        const bool graph_size_changed = sched->prev_graph_size != sched->graph_size;
+
+        if (sched->callback_realloc != NULL) {
+            sched->callback_realloc(sched, &sched->graph, backend_ids_changed, graph_size_changed, sched->callback_realloc_user_data);
+        }
+
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
-            const bool unexpected = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
+            const bool unexpected = !backend_ids_changed && !graph_size_changed;
 
             if (unexpected || sched->debug_realloc > 1) {
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
-                        sched->debug_graph_size, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_realloc);
+                        sched->graph_size, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_realloc);
             }
         }
 
@@ -1990,8 +2002,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
 
-    sched->debug_graph_size = 0;
-    sched->debug_prev_graph_size = 0;
+    sched->graph_size      = 0;
+    sched->prev_graph_size = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -2160,6 +2172,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_copy_user_data = user_data;
 }
 
+void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_realloc = callback;
+    sched->callback_realloc_user_data = user_data;
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
@@ -2231,6 +2249,7 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_ARGMAX:
             return true;
         default:
             return false;
@@ -2634,53 +2653,6 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
 
-// TLlama memory inspection. The generic CPU buffer types do not carry a device pointer.
-ggml_backend_dev_t ggml_backend_memory_buffer_device(ggml_backend_buffer_t buffer) {
-    if (!buffer) {
-        return nullptr;
-    }
-    auto * buft = ggml_backend_buffer_get_type(buffer);
-    auto * device = ggml_backend_buft_get_device(buft);
-    if (!device && (buft == ggml_backend_cpu_buffer_type() || buft == ggml_backend_cpu_buffer_from_ptr_type())) {
-        device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    }
-    return device;
-}
-
-uint32_t ggml_backend_memory_buffer_flags(ggml_backend_buffer_t buffer) {
-    if (!buffer) {
-        return 0;
-    }
-    if (ggml_backend_buffer_is_meta(buffer)) {
-        return GGML_BACKEND_MEMORY_BUFFER_OPAQUE;
-    }
-    auto * device = ggml_backend_memory_buffer_device(buffer);
-    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
-    if (!reg) {
-        return 0;
-    }
-    auto inspect = (ggml_backend_memory_buffer_flags_t) ggml_backend_reg_get_proc_address(reg, "tllama_buffer_memory_flags");
-    if (inspect) {
-        return inspect(buffer);
-    }
-    // Old split backends cannot prove that their objects are leaf allocations.
-    return ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type") ? GGML_BACKEND_MEMORY_BUFFER_OPAQUE : 0;
-}
-
-ggml_backend_memory_allocation_status ggml_backend_memory_buffer_allocations(
-        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user_data) {
-    if (!buffer || !callback) {
-        return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
-    }
-    // A multi-buffer uses its first child's type but has a different context layout.
-    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
-        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
-    }
-    auto * device = ggml_backend_memory_buffer_device(buffer);
-    auto * reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
-    if (!reg) {
-        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
-    }
-    auto inspect = (ggml_backend_memory_buffer_allocations_t) ggml_backend_reg_get_proc_address(reg, "tllama_buffer_memory_allocations_v1");
-    return inspect ? inspect(buffer, callback, user_data) : GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+bool ggml_backend_cpu_buffer_type_is_generic(ggml_backend_buffer_type_t buft) {
+    return buft == ggml_backend_cpu_buffer_type() || buft == ggml_backend_cpu_buffer_from_ptr_type();
 }

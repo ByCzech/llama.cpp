@@ -28,6 +28,31 @@ auto ggml_vk_allocate_memory_record(
     return memory;
 }
 
+// Caller holds the host-allocation lock. Copy existing views without creating imports.
+template<typename Entries, typename Views>
+bool ggml_vk_memory_host_views(const Entries & entries, const void * ptr, size_t size, Views & views, size_t & offset) {
+    views.clear();
+    offset = 0;
+    const auto address = reinterpret_cast<uintptr_t>(ptr);
+    for (const auto & entry : entries) {
+        const auto base = reinterpret_cast<uintptr_t>(entry.base);
+        if (address >= base && address - base < entry.size) {
+            const size_t candidate_offset = address - base;
+            if (size > entry.size - candidate_offset) {
+                return false;
+            }
+            for (const auto & view : entry.views) {
+                if (view) {
+                    views.push_back(view);
+                }
+            }
+            offset = candidate_offset;
+            return !views.empty();
+        }
+    }
+    return false;
+}
+
 inline ggml_backend_memory_allocation_status ggml_vk_memory_visit(
         const ggml_vk_memory_allocation & selected, const void * domain, const void * identity,
         ggml_backend_dev_t device, bool pinned, uint64_t offset, uint64_t size,
