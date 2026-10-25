@@ -1,6 +1,8 @@
 #pragma once
 
-#include "ggml-backend-memory.h"
+#include "../ggml-backend-memory-record.h"
+
+#include <utility>
 
 // SDK-free metadata logic, shared by native allocation attempts and CPU regression tests.
 struct ggml_vk_memory_allocation {
@@ -19,13 +21,8 @@ constexpr uint32_t ggml_vk_memory_device_local_bit = 0x1;
 template<typename Allocate>
 auto ggml_vk_allocate_memory_record(
         ggml_vk_memory_allocation & selected, const ggml_vk_memory_allocation & candidate, Allocate allocate) -> decltype(allocate()) {
-    selected = {};
-    auto memory = allocate();
-    if (memory) {
-        selected = candidate;
-        selected.known = true;
-    }
-    return memory;
+    return ggml_backend_memory_record_attempt(selected, candidate, std::move(allocate),
+        [](const auto & memory) { return bool(memory); });
 }
 
 // Caller holds the host-allocation lock. Copy existing views without creating imports.
@@ -60,7 +57,7 @@ inline ggml_backend_memory_allocation_status ggml_vk_memory_visit(
     if (!selected.known) {
         return size == 0 ? GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE : GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
     }
-    if (!domain || !identity || !device || offset > selected.size_bytes || size > selected.size_bytes - offset) {
+    if (!device) {
         return GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
     }
     const ggml_backend_memory_allocation_property properties[] = {
@@ -83,10 +80,5 @@ inline ggml_backend_memory_allocation_status ggml_vk_memory_visit(
     allocation.size_bytes = selected.size_bytes;
     allocation.properties = properties;
     allocation.property_count = sizeof(properties) / sizeof(properties[0]);
-    const ggml_backend_memory_binding binding = {
-        GGML_BACKEND_MEMORY_BINDING_BUFFER_OFFSET | GGML_BACKEND_MEMORY_BINDING_ALLOCATION_OFFSET | GGML_BACKEND_MEMORY_BINDING_SIZE,
-        0, offset, size,
-    };
-    callback(&allocation, &binding, user_data);
-    return GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE;
+    return ggml_backend_memory_emit_range(allocation, size, 0, offset, size, callback, user_data);
 }

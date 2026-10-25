@@ -379,6 +379,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(test-memory-vulkan PRIVATE ggml)
     llama_test(test-memory-vulkan)
 
+    add_executable(test-memory-record test-memory-record.cpp)
+    target_link_libraries(test-memory-record PRIVATE ggml)
+    llama_test(test-memory-record)
+
     add_executable(test-memory-allocations test-memory-allocations.cpp)
     target_link_libraries(test-memory-allocations PRIVATE ggml)
     llama_test(test-memory-allocations)

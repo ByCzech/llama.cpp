@@ -104,6 +104,61 @@ these properties. SYCL USM kinds also need no heap index. A Level Zero ordinal
 is not a Vulkan heap index. Future unsigned native properties can use new
 names without changing this ABI; other value types require a new ABI.
 
+## Shared metadata helpers
+
+`ggml/src/ggml-backend-memory-record.h` is an internal SDK-free helper, not a
+new public ABI. The Vulkan adapter uses it; CUDA/HIP and SYCL can use the same
+rules when their exporters are attached.
+
+`ggml_backend_memory_record_attempt` clears the selected metadata before the
+native attempt. It commits a copy of the candidate only when the caller's
+success predicate accepts the actual result. The record has a `known` member;
+it must contain the metadata for that specific attempt. Failed managed or
+pinned attempts must not survive a later fallback. Native calls and any advice
+or fallback decisions remain in the backend allocation path, never inspection.
+The helper supports status-returning APIs and nullable/move-only handles.
+
+`ggml_backend_memory_emit_range` accepts an already proved allocation descriptor
+with a known span and a bounded buffer-to-allocation relationship. It validates
+both domains' offsets using subtraction before emitting a binding, including
+zero ranges and UINT64_MAX boundaries. It requires native identity pairs and
+rejects non-unknown locality without a proved device. A managed/shared kind
+does not create a locality claim. APIs without a known span can use the ABI's
+independently known fields directly; this bounded helper returns UNAVAILABLE.
+
+Its COMPLETE result validates one binding, not coverage of the entire buffer
+or all backend allocations. Providers remain responsible for whole-buffer
+coverage and partial/unsupported status. A throwing callback produces UNAVAILABLE;
+the collector must discard all callback results, as required by the ABI.
+
+These helpers own no native memory, identity registry or SDK context. Owners
+must keep identity pairs stable for a live allocation, share them across views,
+clear records at free/reuse and invalidate cached keys before owner destruction.
+They must retain the actual successful allocation path. Tests of the helpers do
+not qualify the owner lifecycle or any native API on hardware.
+
+`test-memory-record` checks retry/fallback provenance, clearing on failure or
+exception, handle success predicates, alias-safe metadata candidates, bounded
+views, equal identity tokens in different domains, unknown association/locality,
+known zero, overflow rejection before callback and callback exceptions.
+`test-memory-vulkan` also exercises the production adapter using these helpers.
+
+## Exporter coverage work list
+
+Keep source implementation, SDK compilation and hardware tests separate. The
+following records the scope at the shared-helper step, not a hardware support
+matrix. No additional exporter is enabled by this step.
+
+| Backend / path | Source status | Remaining qualification |
+| --- | --- | --- |
+| Vulkan ordinary, pinned host and successful host imports | Existing exporter, now using shared attempt/range helpers | Preserve SDK-free regression; native allocation/import/inference tests remain separate. |
+| CUDA ordinary device and managed allocations | Planned L1 | Attach successful-path metadata; compile CUDA 12.4/12.9/13.3; test applicable paths on P100 and available modern GPU. |
+| HIP ordinary device and managed fallback | Planned L2, shared source with CUDA | Record hipMallocManaged versus successful hipMalloc fallback; compile ROCm 10.1; qualify gfx906 and gfx90c UMA. |
+| CUDA/HIP pinned host and registered host views | Planned L1/L2 | Preserve CPU fallback; prove registration-to-buffer bindings and association instead of guessing from the provider. |
+| CUDA/HIP split, VMM and pools | Audit required in L1/L2 | Prove shard/range mapping or expose explicit incomplete coverage; reserved virtual space and idle/internal pools are not automatically backend-buffer allocations. |
+| SYCL device/host/shared/system USM and async paths | Planned L3 | Capture actual USM/context metadata, host fallback and free/reuse; compile oneAPI and test available Intel GPU. |
+| CPU/system allocation exporter | No new exporter in this step | Preserve existing unsupported/unknown behavior. |
+
 ## Vulkan exporter
 
 Vulkan exports this procedure for its ordinary device buffers, pinned host
