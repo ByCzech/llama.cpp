@@ -165,7 +165,8 @@ not a hardware support matrix. SDK-free tests do not qualify GPU execution.
 | HIP ordinary device and managed fallback | Exported; actual successful path retained, shared source with CUDA | Compile ROCm 10.1; qualify gfx906 and gfx90c UMA. |
 | CUDA/HIP host allocations | Exported; CPU context/fallback preserved; known/unproven pinning distinguished | Native host allocation/free, multi-device and low-memory qualification. |
 | CUDA/HIP registered host views and raw CPU aliases | Not exported in this step | Prove registration-to-CPU-buffer bindings and lifecycle before enabling this path. |
-| CUDA/HIP split, VMM and pools | Audit required in L1/L2 | Prove shard/range mapping or expose explicit incomplete coverage; reserved virtual space and idle/internal pools are not automatically backend-buffer allocations. |
+| CUDA/HIP meta/split objects | Unsupported; opaque capacity preserved | Prove shard/range mapping before adding an exporter. |
+| CUDA/HIP VMM and legacy scratch pools | Internal workspace outside backing-buffer scope | Separate workspace accounting would need another scope; do not add reservations or idle pool capacity to this report. |
 | SYCL ordinary USM device, direct Level Zero device, host USM and aligned system allocations | Exported; SDK-free metadata and production host glue tested with fake SDK | Compile oneAPI, including both Level Zero configurations; test Intel GPU and allocation/free/fallback paths. |
 | SYCL split, shared USM helpers, async and other internal workspaces | Not exported in this step | Prove shard/view bindings before adding coverage; internal workspace is outside backing-buffer scope. |
 | CPU/system allocation exporter | No new exporter in this step | Preserve existing unsupported/unknown behavior. |
@@ -336,6 +337,50 @@ Primary API references:
 - [SYCL USM concepts](https://github.khronos.org/SYCL_Reference/iface/usm_basic_concept.html)
 - [SYCL allocation and free APIs](https://github.khronos.org/SYCL_Reference/iface/usm_allocations.html)
 - [Intel USM allocation guidance](https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/unified-shared-memory-allocations.html)
+
+## Snapshot scope audit
+
+The server collector consumes the v1 exporter through the public dispatcher at
+owner-thread capture points. It publishes only named unsigned attributes with
+defined semantics: the Vulkan properties, direct Level Zero ordinal and the
+CUDA/HIP/Level Zero integrated attributes listed above. Unknown attributes are
+filtered to avoid exposing arbitrary native handles. Published attribute differences for
+the same identity pair invalidate that allocation's conflicting bindings.
+`test-memory-report` exercises the actual CUDA/HIP and SYCL metadata translators
+through registry dispatch and JSON collection without an SDK; its simulated
+device metadata does not qualify GPU behavior.
+
+Ordinary tensor views and multiple owners referencing the same ggml buffer use
+that buffer's allocation identity and existing deduplicated binding. This does
+not establish a relationship between independently created CPU_Mapped objects
+or arbitrary pointers into a host allocation. The generic CPU types dispatch
+through the CPU backend, which does not export those registrations/aliases.
+
+In this source snapshot, `ggml_backend_cuda_register_host_buffer` and its
+unregister counterpart are exported public/procedure APIs, including the HIP
+mapping, but the native model loader/server has no call site. They take a raw
+pointer/span, not a ggml buffer owner. Adding their metadata alone would not
+connect them to CPU_Mapped snapshots. Supporting external callers needs an
+explicit registration owner, view bindings, invalidation before unregister and
+free, and CPU-dispatch integration. This is a separate extension, not evidence
+that current unregistered mmap buffers are pinned. Registration must never add
+another allocated capacity for the same bytes.
+
+Generic multi-buffers are traversed to leaves by `ggml_backend_buffer_visit`;
+direct inspection of their container remains UNSUPPORTED. CUDA/HIP meta/split
+objects have their own layout and synthetic base, and are not ordinary CUDA
+buffer contexts. SYCL split buffers likewise use a synthetic base and per-tensor
+shards. These objects remain opaque/unsupported rather than publishing invented
+contiguous native spans. Their missing allocation coverage does not turn known
+ordinary leaf capacities into unknown capacities.
+
+The CUDA/HIP ordinary buffer factory uses the direct device allocator, not the
+VMM scratch pool. `ggml_cuda_pool_vmm` serves internal temporary allocations;
+its virtual reservation is not a backing-buffer allocation. Legacy pools,
+graph/library workspaces and SYCL internal temporary allocations also remain
+outside this scope. This report does not claim complete process/device memory
+or physical residency. Native SDK compilation and hardware qualification are
+still required independently of this source audit.
 
 ## Buffer bindings
 

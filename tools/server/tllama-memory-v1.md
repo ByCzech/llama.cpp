@@ -177,8 +177,13 @@ Each allocation contains:
 | `native_properties` | Known unsigned native attributes; absent keys are unknown, while zero values are valid. |
 
 Published attribute names are `vulkan.memory_type_index`, `vulkan.heap_index`,
-`vulkan.memory_property_flags`, `vulkan.heap_flags`, and
-`level_zero.memory_ordinal`. They keep their native meanings. Unrecognized
+`vulkan.memory_property_flags`, `vulkan.heap_flags`, `level_zero.memory_ordinal`,
+`cuda.device_integrated`, `hip.device_integrated`, and
+`level_zero.device_integrated`. The integrated attributes are known 0/1 values
+from the successful allocation device's saved native properties; absence means
+unknown. They describe the associated allocation device, not the buffer
+provider, and do not change weight assignment or measure physical residency.
+They keep their native meanings. Unrecognized
 native attributes are ignored rather than exposing arbitrary handles/tokens.
 Vulkan DEVICE_LOCAL and HOST_VISIBLE bits are independent. CUDA/HIP ordinary
 allocations and SYCL USM need no Vulkan heap/type index. Managed/shared/system

@@ -41,7 +41,8 @@ const char * locality_name(ggml_backend_memory_allocation_locality locality) {
 bool published_property(const std::string & name) {
     // Publish only attributes with defined numeric semantics, never arbitrary native tokens/handles.
     return name == "vulkan.memory_type_index" || name == "vulkan.heap_index" ||
-        name == "vulkan.memory_property_flags" || name == "vulkan.heap_flags" || name == "level_zero.memory_ordinal";
+        name == "vulkan.memory_property_flags" || name == "vulkan.heap_flags" || name == "level_zero.memory_ordinal" ||
+        name == "cuda.device_integrated" || name == "hip.device_integrated" || name == "level_zero.device_integrated";
 }
 
 bool valid_range(bool offset_known, uint64_t offset, bool size_known, uint64_t size, bool span_known, uint64_t span) {
