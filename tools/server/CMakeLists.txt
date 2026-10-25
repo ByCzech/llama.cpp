@@ -88,3 +88,17 @@ if (LLAMA_BUILD_TESTS AND TARGET test-memory-buffers)
         set_tests_properties(test-memory-http PROPERTIES TIMEOUT 90)
     endif()
 endif()
+
+if (LLAMA_BUILD_TESTS AND TARGET test-instella-moe)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+            RESULT_VARIABLE INSTELLA_NUMPY_STATUS OUTPUT_QUIET ERROR_QUIET)
+        if (INSTELLA_NUMPY_STATUS EQUAL 0)
+            add_test(NAME test-instella-moe-numeric
+                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-instella-moe.py
+                    --runner $<TARGET_FILE:test-instella-moe> --server $<TARGET_FILE:llama-server>)
+            set_tests_properties(test-instella-moe-numeric PROPERTIES TIMEOUT 240 LABELS "behavior")
+        endif()
+    endif()
+endif()

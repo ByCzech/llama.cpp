@@ -387,6 +387,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(test-memory-buffers PRIVATE llama)
     llama_test(test-memory-buffers ARGS ${CMAKE_CURRENT_BINARY_DIR}/test-memory-buffers.gguf)
 
+    add_executable(test-instella-moe test-instella-moe.cpp)
+    target_link_libraries(test-instella-moe PRIVATE llama)
+
     add_executable(test-memory-weight-storage test-memory-weight-storage.cpp)
     target_link_libraries(test-memory-weight-storage PRIVATE llama)
     llama_test(test-memory-weight-storage)

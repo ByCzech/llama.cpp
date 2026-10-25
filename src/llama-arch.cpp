@@ -169,6 +169,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_K2_HORIZON,       "k2-horizon"       },
     { LLM_ARCH_BEAM,             "beam"             },
     { LLM_ARCH_KOLIBRI1,         "kolibri1"         },
+    { LLM_ARCH_INSTELLA_MOE,     "instella-moe"     },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -1306,6 +1307,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_INSTELLA_MOE:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_HY_V4:
         case LLM_ARCH_DOTS3NOTE:
