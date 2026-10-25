@@ -11,6 +11,7 @@
 //
 
 #include "ggml-backend-memory.h"
+#include "ggml-sycl/ggml-sycl-memory.hpp"
 
 #include <algorithm>
 #include <array>
@@ -728,6 +729,7 @@ struct ggml_backend_sycl_buffer_context {
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
     host_staging staging;
     bool is_usm_system;
+    ggml_sycl_memory_record memory;
 
     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
         device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
@@ -752,12 +754,14 @@ struct ggml_backend_sycl_buffer_context {
 
     ~ggml_backend_sycl_buffer_context() {
         drop_host_staging();
+        auto allocation = memory;
+        memory = {};
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
             if (is_usm_system)
                 free_aligned_mem_host(dev_ptr);
             else
-                SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream)));
+                SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream, &allocation)));
         }
 
         //release extra used by tensors
@@ -1159,6 +1163,12 @@ static bool check_usm_system(int device, size_t size) {
     return use_usm_system;
 }
 
+#ifdef _WIN32
+static constexpr const char * ggml_sycl_system_memory_api = "_aligned_malloc";
+#else
+static constexpr const char * ggml_sycl_system_memory_api = "aligned_alloc";
+#endif
+
 inline void * aligned_malloc_host(size_t alignment, size_t size) {
 #ifdef _WIN32
     return _aligned_malloc(size, alignment);
@@ -1188,21 +1198,30 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     bool use_usm_system = check_usm_system(buft_ctx->device, aligned_size);
 
     void * dev_ptr;
+    ggml_sycl_memory_record memory;
     if (use_usm_system) {
         GGML_SYCL_DEBUG("[SYCL] allocating %zu Bytes with USM system\n", size);
-        dev_ptr = (void *)aligned_malloc_host(alignment, aligned_size);
+        dev_ptr = ggml_backend_memory_record_attempt(memory,
+            ggml_sycl_memory_candidate(GGML_BACKEND_MEMORY_ALLOCATION_KIND_SYSTEM, ggml_sycl_system_memory_api, aligned_size),
+            [&] { return aligned_malloc_host(alignment, aligned_size); }, [](const void * result) { return result != nullptr; });
         if (!dev_ptr) {
             GGML_LOG_ERROR("%s: can't allocate %zu Bytes of memory on host\n", __func__, size);
             return nullptr;
         }
     } else {
-        SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream, GGML_SYCL_MEM_BUFFER)));
+        SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream, GGML_SYCL_MEM_BUFFER, &memory)));
         if (!dev_ptr) {
           GGML_LOG_ERROR("%s: can't allocate %zu Bytes of memory on device\n", __func__, size);
           return nullptr;
         }
     }
     ggml_backend_sycl_buffer_context * ctx = new  ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, buft_ctx->stream, use_usm_system);
+    if (!use_usm_system) {
+        memory.device = ggml_backend_buft_get_device(buft);
+        memory.device_type_known = ggml_sycl_info().devices[buft_ctx->device].l0_device_type_valid;
+        memory.discrete = ggml_sycl_info().devices[buft_ctx->device].l0_discrete_gpu;
+    }
+    ctx->memory = std::move(memory);
     return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
 }
 catch (sycl::exception const &exc) {
@@ -1775,15 +1794,23 @@ static int ggml_backend_sycl_host_buffer_type_device(ggml_backend_buffer_type_t 
 }
 
 //host pinned memory
-static void * ggml_backend_sycl_host_malloc(int device, size_t size) {
+static void * ggml_backend_sycl_host_malloc(int device, size_t size, ggml_sycl_memory_record * metadata = nullptr) {
+    ggml_sycl_memory_record temporary;
+    auto & selected = metadata ? *metadata : temporary;
+    selected = {};
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_host_malloc of size %.2f MiB on device %d\n", size / 1024.0 / 1024.0, device);
     void * ptr = nullptr;
     try {
         ggml_check_sycl();
-        // USM host memory is page-locked and device-accessible by construction
+        // USM host type/context do not by themselves prove OS page-locking.
         auto & q = dpct::dev_mgr::instance().get_device(device).default_queue();
-        ptr = sycl::malloc_host(size, q, sycl::property_list{});
+        ptr = ggml_backend_memory_record_attempt(selected,
+            ggml_sycl_memory_candidate(GGML_BACKEND_MEMORY_ALLOCATION_KIND_HOST, "sycl::malloc_host", size),
+            [&] { return sycl::malloc_host(size, q, sycl::property_list{}); },
+            [](const void * result) { return result != nullptr; });
+        ggml_sycl_memory_capture_context(metadata, q);
     } catch (...) {
+        selected = {};
         ptr = nullptr;
     }
     if (ptr == nullptr) {
@@ -1794,23 +1821,41 @@ static void * ggml_backend_sycl_host_malloc(int device, size_t size) {
     return ptr;
 }
 
+static ggml_sycl_memory_host_records & ggml_sycl_host_memory_records() {
+    static ggml_sycl_memory_host_records records;
+    return records;
+}
+
 static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     if (buffer->context == nullptr) {
         return;
     }
-    if (g_ggml_sycl_enable_host_pinned_mem) {
-        const int device = ggml_backend_sycl_host_buffer_type_device(buffer->buft);
-        auto & q = dpct::dev_mgr::instance().get_device(device).default_queue();
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(buffer->context, q)));
+    const auto memory = ggml_sycl_host_memory_records().find(buffer);
+    ggml_sycl_host_memory_records().forget(buffer);
+    const bool usm = memory && memory->known ? memory->kind == GGML_BACKEND_MEMORY_ALLOCATION_KIND_HOST : g_ggml_sycl_enable_host_pinned_mem;
+    if (usm) {
+        if (memory && memory->context) {
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(buffer->context, *static_cast<const sycl::context *>(memory->context.get()))));
+        } else {
+            const int device = ggml_backend_sycl_host_buffer_type_device(buffer->buft);
+            auto & q = dpct::dev_mgr::instance().get_device(device).default_queue();
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(buffer->context, q)));
+        }
     } else {
         free_aligned_mem_host((void *) buffer->context);
     }
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = g_ggml_sycl_enable_host_pinned_mem ?
-                     ggml_backend_sycl_host_malloc(ggml_backend_sycl_host_buffer_type_device(buft), size) :
-                     aligned_malloc_host(TENSOR_ALIGNMENT, size);
+    ggml_sycl_memory_record memory;
+    void * ptr;
+    if (g_ggml_sycl_enable_host_pinned_mem) {
+        ptr = ggml_backend_sycl_host_malloc(ggml_backend_sycl_host_buffer_type_device(buft), size, &memory);
+    } else {
+        ptr = ggml_backend_memory_record_attempt(memory,
+            ggml_sycl_memory_candidate(GGML_BACKEND_MEMORY_ALLOCATION_KIND_SYSTEM, ggml_sycl_system_memory_api, size),
+            [&] { return aligned_malloc_host(TENSOR_ALIGNMENT, size); }, [](const void * result) { return result != nullptr; });
+    }
     if (ptr == nullptr) {
         // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
@@ -1820,6 +1865,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
+    ggml_sycl_host_memory_records().remember(buffer, memory);
 
     return buffer;
 }
@@ -8084,7 +8130,29 @@ static uint32_t ggml_backend_sycl_memory_buffer_flags(ggml_backend_buffer_t buff
     return buffer->buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name ? GGML_BACKEND_MEMORY_BUFFER_OPAQUE : 0;
 }
 
+static ggml_backend_memory_allocation_status ggml_backend_sycl_memory_allocations(
+        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user_data) {
+    const auto size = ggml_backend_buffer_get_size(buffer);
+    if (size == 0 && !buffer->context) { return GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE; }
+    if (buffer->iface.free_buffer == ggml_backend_sycl_host_buffer_free_buffer) {
+        const auto memory = ggml_sycl_host_memory_records().find(buffer);
+        return memory ? ggml_sycl_memory_visit(*memory, memory.get(), size, callback, user_data) :
+            GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    if (buffer->iface.free_buffer != ggml_backend_sycl_buffer_free_buffer) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    const auto * ctx = static_cast<const ggml_backend_sycl_buffer_context *>(buffer->context);
+    if (!ctx || !ctx->dev_ptr) {
+        return size == 0 ? GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE : GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    return ggml_sycl_memory_visit(ctx->memory, ctx, size, callback, user_data);
+}
+
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
+    if (strcmp(name, "tllama_buffer_memory_allocations_v1") == 0) {
+        return (void *) ggml_backend_sycl_memory_allocations;
+    }
     if (strcmp(name, "tllama_buffer_memory_flags") == 0) {
         return (void *) ggml_backend_sycl_memory_buffer_flags;
     }

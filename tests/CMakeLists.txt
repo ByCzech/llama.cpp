@@ -379,6 +379,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(test-memory-vulkan PRIVATE ggml)
     llama_test(test-memory-vulkan)
 
+    add_executable(test-memory-sycl test-memory-sycl.cpp)
+    target_link_libraries(test-memory-sycl PRIVATE ggml)
+    llama_test(test-memory-sycl)
+
     find_package(Threads REQUIRED)
     add_executable(test-memory-cuda test-memory-cuda.cpp)
     target_link_libraries(test-memory-cuda PRIVATE ggml Threads::Threads)
@@ -391,6 +395,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-memory-cuda-native.py
                     --compiler ${CMAKE_CXX_COMPILER} --ggml $<TARGET_FILE:ggml> --base $<TARGET_FILE:ggml-base>)
             set_tests_properties(test-memory-cuda-native PROPERTIES TIMEOUT 240)
+            add_test(NAME test-memory-sycl-native
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-memory-sycl-native.py
+                    --compiler ${CMAKE_CXX_COMPILER} --ggml $<TARGET_FILE:ggml> --base $<TARGET_FILE:ggml-base>)
+            set_tests_properties(test-memory-sycl-native PROPERTIES TIMEOUT 240)
         endif()
     endif()
 

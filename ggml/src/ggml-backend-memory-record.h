@@ -2,6 +2,10 @@
 
 #include "ggml-backend-memory.h"
 
+#include <map>
+#include <memory>
+#include <mutex>
+
 // Allocation paths, never inspection paths, invoke the native attempt. A record
 // with a bool `known` member describes only a successful attempt, including fallback.
 template<typename Record, typename Attempt, typename Succeeded>
@@ -43,3 +47,38 @@ inline ggml_backend_memory_allocation_status ggml_backend_memory_emit_range(
     }
     return GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE;
 }
+
+// Metadata is owned separately from native/CPU buffer contexts. Owners erase
+// entries before native free; inspection retains an immutable record only.
+template<typename Record>
+class ggml_backend_memory_record_registry {
+    mutable std::mutex mutex;
+    std::map<const void *, std::shared_ptr<const Record>> records;
+public:
+    void remember(const void * buffer, const Record & record) noexcept {
+        try {
+            std::lock_guard<std::mutex> guard(mutex);
+            records.erase(buffer);
+            if (buffer && record.known) {
+                records.emplace(buffer, std::make_shared<const Record>(record));
+            }
+        } catch (...) {
+            // Allocation succeeded; missing diagnostic metadata must not change its behavior.
+        }
+    }
+
+    std::shared_ptr<const Record> find(const void * buffer) const noexcept {
+        try {
+            std::lock_guard<std::mutex> guard(mutex);
+            const auto found = records.find(buffer);
+            return found == records.end() ? nullptr : found->second;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    void forget(const void * buffer) noexcept {
+        std::lock_guard<std::mutex> guard(mutex);
+        records.erase(buffer);
+    }
+};

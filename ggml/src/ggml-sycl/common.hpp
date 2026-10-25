@@ -433,9 +433,11 @@ struct ggml_tensor_extra_gpu {
 };
 
 extern int g_ggml_sycl_use_level_zero_api;
+struct ggml_sycl_memory_record;
 void * ggml_sycl_malloc_device(size_t size, sycl::queue &q,
-                               ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT);
-void ggml_sycl_free_device(void *ptr, sycl::queue &q);
+                               ggml_sycl_mem_type type = GGML_SYCL_MEM_DIRECT,
+                               ggml_sycl_memory_record * metadata = nullptr);
+void ggml_sycl_free_device(void *ptr, sycl::queue &q, const ggml_sycl_memory_record * metadata = nullptr);
 
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 

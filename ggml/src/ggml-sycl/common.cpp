@@ -11,6 +11,9 @@
 //
 
 #include "common.hpp"
+#include "ggml-sycl-memory.hpp"
+
+#include <cstring>
 #include <sycl/backend.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
@@ -94,7 +97,11 @@ static bool ggml_sycl_use_level_zero_device_alloc(sycl::queue &q) {
 
 // Use Level Zero zeMemAllocDevice to avoid sycl::malloc_device triggering
 // DMA-buf/TTM system RAM staging in the xe kernel driver during multi-GPU inference.
-void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
+void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type,
+                               ggml_sycl_memory_record * metadata) {
+    ggml_sycl_memory_record temporary;
+    auto & selected = metadata ? *metadata : temporary;
+    selected = {};
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
     if (ggml_sycl_use_level_zero_device_alloc(q)) {
         void *ptr = nullptr;
@@ -116,35 +123,53 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type t
         ze_device_mem_alloc_desc_t alloc_desc = {ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, nullptr, 0, 0};
 #endif
         // request SYCL_BUFFER_ALIGNMENT so tensor offsets aligned to it stay aligned in absolute terms
-        ze_result_t r = zeMemAllocDevice(ze_ctx, &alloc_desc, size, SYCL_BUFFER_ALIGNMENT, ze_dev, &ptr);
-        if (r == ZE_RESULT_SUCCESS && ptr) {
+        auto candidate = ggml_sycl_memory_candidate(GGML_BACKEND_MEMORY_ALLOCATION_KIND_DEVICE, "zeMemAllocDevice", size);
+        candidate.ordinal_known = true;
+        candidate.ordinal = alloc_desc.ordinal;
+        ptr = ggml_backend_memory_record_attempt(selected, candidate, [&] {
+            void * result = nullptr;
+            const auto status = zeMemAllocDevice(ze_ctx, &alloc_desc, size, SYCL_BUFFER_ALIGNMENT, ze_dev, &result);
+            return status == ZE_RESULT_SUCCESS ? result : nullptr;
+        }, [](const void * result) { return result != nullptr; });
+        if (ptr) {
             ggml_sycl_memtrace_add(type, ptr, size);
+            ggml_sycl_memory_capture_context(metadata, q);
             return ptr;
         }
         ggml_sycl_memtrace_fail(type, size);
         return nullptr;
     }
 #endif
-    void * ptr = sycl::malloc_device(size, q);
+    void * ptr = ggml_backend_memory_record_attempt(selected,
+        ggml_sycl_memory_candidate(GGML_BACKEND_MEMORY_ALLOCATION_KIND_DEVICE, "sycl::malloc_device", size),
+        [&] { return sycl::malloc_device(size, q); }, [](const void * result) { return result != nullptr; });
     if (ptr == nullptr) {
         ggml_sycl_memtrace_fail(type, size);
         return nullptr;
     }
     ggml_sycl_memtrace_add(type, ptr, size);
+    ggml_sycl_memory_capture_context(metadata, q);
     return ptr;
 }
 
-void ggml_sycl_free_device(void *ptr, sycl::queue &q) {
+void ggml_sycl_free_device(void *ptr, sycl::queue &q, const ggml_sycl_memory_record * metadata) {
     if (!ptr) return;
     ggml_sycl_memtrace_del(ptr);
+    const bool known = metadata && metadata->known && metadata->api;
+    const auto * context = known && metadata->context ? static_cast<const sycl::context *>(metadata->context.get()) : nullptr;
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-    if (ggml_sycl_use_level_zero_device_alloc(q)) {
-        auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+    const bool native_l0 = known ? std::strcmp(metadata->api, "zeMemAllocDevice") == 0 : ggml_sycl_use_level_zero_device_alloc(q);
+    if (native_l0) {
+        auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context ? *context : q.get_context());
         zeMemFree(ze_ctx, ptr);
         return;
     }
 #endif
-    SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, q)));
+    if (context) {
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *context)));
+    } else {
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, q)));
+    }
 }
 
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams) {

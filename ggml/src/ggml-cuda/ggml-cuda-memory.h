@@ -95,36 +95,4 @@ inline ggml_backend_memory_allocation_status ggml_cuda_memory_visit(
     return ggml_backend_memory_emit_range(a, buffer_size, 0, 0, buffer_size, callback, user_data);
 }
 
-// Keep CPU buffer contexts untouched. The buffer owner erases this metadata
-// before cudaFreeHost/hipHostFree; inspection only copies an existing record.
-class ggml_cuda_memory_host_records {
-    mutable std::mutex mutex;
-    std::map<const void *, std::shared_ptr<const ggml_cuda_memory_record>> records;
-public:
-    void remember(const void * buffer, const ggml_cuda_memory_record & record) noexcept {
-        try {
-            std::lock_guard<std::mutex> guard(mutex);
-            records.erase(buffer);
-            if (buffer && record.known) {
-                records.emplace(buffer, std::make_shared<const ggml_cuda_memory_record>(record));
-            }
-        } catch (...) {
-            // Allocation succeeded; missing diagnostic metadata must not change its behavior.
-        }
-    }
-
-    std::shared_ptr<const ggml_cuda_memory_record> find(const void * buffer) const noexcept {
-        try {
-            std::lock_guard<std::mutex> guard(mutex);
-            const auto found = records.find(buffer);
-            return found == records.end() ? nullptr : found->second;
-        } catch (...) {
-            return nullptr;
-        }
-    }
-
-    void forget(const void * buffer) noexcept {
-        std::lock_guard<std::mutex> guard(mutex);
-        records.erase(buffer);
-    }
-};
+using ggml_cuda_memory_host_records = ggml_backend_memory_record_registry<ggml_cuda_memory_record>;

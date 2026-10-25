@@ -98,6 +98,7 @@ ignored. Missing values are not zero. V1 attribute conventions are:
 | `cuda.device_integrated` | Saved cudaDeviceProp::integrated, normalized to 0/1, for the proved allocation device. |
 | `hip.device_integrated` | Saved hipDeviceProp_t::integrated, normalized to 0/1, for the proved allocation device. |
 | `level_zero.memory_ordinal` | Ordinal accepted by the direct Level Zero allocation path. |
+| `level_zero.device_integrated` | Saved Level Zero device type, normalized to 0/1, for the proved allocation device. |
 
 Vulkan `DEVICE_LOCAL` and `HOST_VISIBLE` bits are independent. Preserve raw flags
 and their native meaning. CUDA/HIP ordinary allocations have no required Vulkan
@@ -109,8 +110,8 @@ names without changing this ABI; other value types require a new ABI.
 ## Shared metadata helpers
 
 `ggml/src/ggml-backend-memory-record.h` is an internal SDK-free helper, not a
-new public ABI. The Vulkan adapter uses it; CUDA/HIP and SYCL can use the same
-rules when their exporters are attached.
+new public ABI. Vulkan, CUDA/HIP and SYCL exporters use the same attempt/range
+rules.
 
 `ggml_backend_memory_record_attempt` clears the selected metadata before the
 native attempt. It commits a copy of the candidate only when the caller's
@@ -133,11 +134,17 @@ or all backend allocations. Providers remain responsible for whole-buffer
 coverage and partial/unsupported status. A throwing callback produces UNAVAILABLE;
 the collector must discard all callback results, as required by the ABI.
 
-These helpers own no native memory, identity registry or SDK context. Owners
+The attempt/range helpers own no native memory, identity registry or SDK context. Owners
 must keep identity pairs stable for a live allocation, share them across views,
 clear records at free/reuse and invalidate cached keys before owner destruction.
 They must retain the actual successful allocation path. Tests of the helpers do
 not qualify the owner lifecycle or any native API on hardware.
+
+`ggml_backend_memory_record_registry<Record>` retains immutable host metadata
+under a mutex. `remember` replaces stale entries and tolerates diagnostic
+allocation failure, `find` retains a record before releasing the lock, and
+`forget` erases it before native free. CUDA/HIP and SYCL share this registry;
+its extraction from the CUDA helper does not change CUDA/HIP behavior.
 
 `test-memory-record` checks retry/fallback provenance, clearing on failure or
 exception, handle success predicates, alias-safe metadata candidates, bounded
@@ -148,7 +155,7 @@ known zero, overflow rejection before callback and callback exceptions.
 ## Exporter coverage work list
 
 Keep source implementation, SDK compilation and hardware tests separate. The
-following records source coverage after the initial CUDA/HIP exporter step,
+following records source coverage after the initial CUDA/HIP and SYCL exporter steps,
 not a hardware support matrix. SDK-free tests do not qualify GPU execution.
 
 | Backend / path | Source status | Remaining qualification |
@@ -159,7 +166,8 @@ not a hardware support matrix. SDK-free tests do not qualify GPU execution.
 | CUDA/HIP host allocations | Exported; CPU context/fallback preserved; known/unproven pinning distinguished | Native host allocation/free, multi-device and low-memory qualification. |
 | CUDA/HIP registered host views and raw CPU aliases | Not exported in this step | Prove registration-to-CPU-buffer bindings and lifecycle before enabling this path. |
 | CUDA/HIP split, VMM and pools | Audit required in L1/L2 | Prove shard/range mapping or expose explicit incomplete coverage; reserved virtual space and idle/internal pools are not automatically backend-buffer allocations. |
-| SYCL device/host/shared/system USM and async paths | Planned L3 | Capture actual USM/context metadata, host fallback and free/reuse; compile oneAPI and test available Intel GPU. |
+| SYCL ordinary USM device, direct Level Zero device, host USM and aligned system allocations | Exported; SDK-free metadata and production host glue tested with fake SDK | Compile oneAPI, including both Level Zero configurations; test Intel GPU and allocation/free/fallback paths. |
+| SYCL split, shared USM helpers, async and other internal workspaces | Not exported in this step | Prove shard/view bindings before adding coverage; internal workspace is outside backing-buffer scope. |
 | CPU/system allocation exporter | No new exporter in this step | Preserve existing unsupported/unknown behavior. |
 
 ## CUDA/HIP exporter
@@ -271,6 +279,63 @@ verifies the successful second type/heap and tests import failure, pinned ranges
 local/nonlocal flags, CPU fallback dispatch and empty results. Native pinned-map
 lookup, actual import/allocation and inference still require Vulkan hardware
 checks; the CPU fixture does not replace them.
+
+## SYCL exporter
+
+The v1 procedure covers ordinary backend-owned `sycl::malloc_device` and direct
+`zeMemAllocDevice` buffers, host `sycl::malloc_host` buffers, and the existing
+aligned system-allocation paths. Only a successful attempt supplies metadata.
+Failed host allocation still returns the actual CPU fallback buffer, without
+metadata from the failed SYCL attempt. Device allocation failure does not add a
+new fallback or change the existing Level Zero selector.
+
+USM/Level Zero records retain a copy of the successful allocation's SYCL context.
+The domain token is this retained context object, not a globally canonical
+context ID; the identity is the owned allocation context or immutable host
+record. Future aliases must reuse both original tokens. Different owned
+allocations remain distinct even when their numeric addresses match. Context
+capture failure preserves native allocation success but inspection returns
+UNAVAILABLE. No context, native pointer or handle is published in JSON.
+
+Free removes the stored record before releasing native memory and retains a
+local copy through that release. It uses the saved successful allocator and
+context when available, rather than a changed allocator selector/default queue.
+Untracked internal calls retain their existing behavior. Host buffers keep the
+CPU raw-pointer context and get/clear/copy operations; inspection reads the
+separate immutable metadata registry and releases its lock before callbacks.
+
+Device buffers associate their existing registry device. Existing cached,
+valid Level Zero device-type evidence supplies `level_zero.device_integrated`;
+only a proved discrete device's DEVICE allocation is DEVICE_LOCAL. Integrated,
+unknown, host and system paths retain UNKNOWN locality. Only the direct Level
+Zero path reports its accepted memory ordinal; ordinary USM does not guess one.
+This is API locality, not measured residency or dedicated physical VRAM.
+
+Host USM is HOST, without inferred OS page-locking or a provider-GPU association.
+Aligned allocations are SYSTEM with the actual platform API name and no SYCL
+context/device claim. The ordinary system path reports the accepted aligned
+native span, including its existing padding; the binding keeps the ggml buffer's
+original capacity. Allocation span is not an additional capacity to sum.
+
+There is no backend backing-buffer `malloc_shared` path to export in this step.
+Shared USM helpers, asynchronous reorder allocations, upload staging, pools,
+communication and other internal workspaces are outside this backing-buffer
+scope. Split tensor buffers keep OPAQUE capacity and UNSUPPORTED allocation
+coverage until shard bindings are proved. Host-pointer import/registration is
+not implemented by this SYCL backend. No alias relationship is inferred from
+raw address equality.
+
+`test-memory-sycl` tests metadata/context lifetime and ranges without an SDK.
+`test-memory-sycl-native` compiles selected actual production host functions
+against a fake SDK in USM, Level Zero and relaxed-Level-Zero configurations.
+It checks fallback/free provenance, registry lifecycle and side-effect-free
+inspection. Neither test compiles kernels or qualifies oneAPI/Intel hardware.
+
+Primary API references:
+
+- [SYCL USM concepts](https://github.khronos.org/SYCL_Reference/iface/usm_basic_concept.html)
+- [SYCL allocation and free APIs](https://github.khronos.org/SYCL_Reference/iface/usm_allocations.html)
+- [Intel USM allocation guidance](https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/unified-shared-memory-allocations.html)
 
 ## Buffer bindings
 
