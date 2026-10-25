@@ -686,6 +686,7 @@ struct common_params {
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
+    int32_t memory_tensor_diagnostics = 0; // optional bounded weight-tensor metadata in memory snapshots
 
     // enable built-in tools
     std::vector<std::string> server_tools;

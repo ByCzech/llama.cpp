@@ -240,6 +240,17 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     printf("test-arg-parser: test valid usage\n\n");
+    for (const std::string limit : {"0", "1", "4096"}) {
+        common_params diagnostic_params;
+        argv = {"binary_name", "--memory-tensor-diagnostics", limit};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), diagnostic_params, LLAMA_EXAMPLE_SERVER));
+        assert(diagnostic_params.memory_tensor_diagnostics == std::stoi(limit));
+    }
+    for (const std::string limit : {"-1", "4097", "invalid"}) {
+        common_params diagnostic_params;
+        argv = {"binary_name", "--memory-tensor-diagnostics", limit};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), diagnostic_params, LLAMA_EXAMPLE_SERVER));
+    }
 
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

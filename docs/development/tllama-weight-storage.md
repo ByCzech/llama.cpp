@@ -69,7 +69,32 @@ Static weight metadata is captured with the model inventory. A model shared by m
 
 Old schema-V1 responses remain valid. The native HTTP test accepts the section as optional and validates its interval bounds and references when present. The client needs a separate adapter change to validate/use the new section and to avoid adding model buffer capacities to the same payload again. An unknown-field-tolerant reader alone does not use the new accounting.
 
-## Compatibility audit
+## Optional tensor diagnostics
+
+Start the worker with `--memory-tensor-diagnostics N` (environment: `LLAMA_ARG_MEMORY_TENSOR_DIAGNOSTICS`). The default is 0, disabled. Values outside 0-4096 are rejected. The setting is retained across sleep/reload. No new endpoint or authentication path is added.
+
+When enabled, `weight_storage.tensor_diagnostics` adds `status`, `record_limit`, `range_limit`, `truncated`, `name_encoding`, `missing_components` and `records`. Record and range limits apply across all model owners in one snapshot. There are at most N records and 16384 copied ranges. A record is one tensor-role visit, not a unique storage allocation; tied input/output roles can produce multiple records for the same bytes. Do not add these sizes to the interval total.
+
+Each record has `id`, `tensor_name`, `owner_id`, `component`, `layer_index`, `buffer_id`, `storage_status`, `storage_reason`, `size_bytes`, `ranges_complete`, `ranges` and `assignment`. IDs and names are copied metadata, not addresses. Names are bounded by the native GGML name array. `name_encoding = byte_escape` preserves printable ASCII, doubles a literal backslash and writes other bytes as backslash-x followed by two hexadecimal digits. This also makes malformed/non-UTF8 names safe to serialize. A missing tensor has a null name; an unproved role has a null component; a missing buffer reference has a null buffer_id.
+
+`storage_status = unavailable` has a reason, null size, no ranges and ranges_complete false. Known geometry keeps the full per-tensor payload size even if the diagnostic range budget is exhausted; the stored ranges are then an explicitly incomplete prefix with ranges_complete false. Each range has offset_bytes and size_bytes relative to the record's buffer. Assignment is independent of geometry and uses the same checked loader evidence as the main section.
+
+Limits add diagnostic_record_limit or diagnostic_range_limit to diagnostic missing_components and set truncated true. Collection failure adds diagnostic_collection_failed. These affect diagnostic coverage only, not the main weight_storage status, intervals or missing_components. Underlying storage/assignment failures remain visible in both coverages. A truncated=false flag alone does not prove completeness: inspect status and individual record fields too.
+
+Capture runs with the static model inventory on the owner thread, never in the HTTP handler. Names are not copied and no diagnostic JSON field is emitted when disabled. Unload/failure clears the records before owner destruction; a proved unloaded state has known empty diagnostics, while loading/failure is unavailable with a reason. Changing the owner-thread setting invalidates the native model cache; the next capture/transition publishes the new setting.
+
+For the P100 case, keep the same model/projector/draft, context, KV types, flash attention and offload parameters, and add `--memory-tensor-diagnostics 4096`. Save the complete raw endpoint and loader log using the same authenticated method as the original capture. Inspect the specific native layers without assuming what their CPU tensors are:
+
+```bash
+jq '.weight_storage.tensor_diagnostics.records[]
+    | select(.layer_index == 39 or .layer_index == 40)
+    | {tensor_name, component, layer_index, buffer_id, size_bytes,
+       storage_status, storage_reason, ranges_complete, ranges, assignment}' memory.json
+```
+
+Resolve assignment device_ids against the same snapshot's devices. Use the deduplicated main intervals for totals, not the sum of diagnostic rows. Compare actual tensor evidence with the old mmap span; do not infer payload from the number of offloaded layers or from nvidia-smi. Diagnostic capture does not measure physical residency. This feature does not itself qualify the P100 case or any GPU backend.
+
+## Client compatibility audit
 
 The TLlama reader at `a7cf2e970e4999a6c0fd28293fd2ad1329969732` explicitly ignores unknown fields in `_record()` and only recognizes current extensions in `_extensions()`. Its existing `test_v1_additions_are_ignored_and_new_role_component_reason_names_survive` covers this behavior. An optional top-level `weight_storage` is compatible with that reader, but is discarded until the dependent client update. `_native_memory_sizes()` still uses buffer totals for mixed placement at that revision.
 

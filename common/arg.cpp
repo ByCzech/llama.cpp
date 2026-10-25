@@ -3638,6 +3638,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_REUSE"));
     add_opt(common_arg(
+        {"--memory-tensor-diagnostics"}, "N",
+        "include up to N weight-tensor diagnostic records in memory snapshots (0-4096, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 4096) {
+                throw std::invalid_argument("memory tensor diagnostics must be between 0 and 4096");
+            }
+            params.memory_tensor_diagnostics = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MEMORY_TENSOR_DIAGNOSTICS"));
+    add_opt(common_arg(
         {"--metrics"},
         string_format("enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled"),
         [](common_params & params) {

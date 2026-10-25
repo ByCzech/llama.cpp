@@ -249,6 +249,90 @@ static void test_random_relationships() {
     }
 }
 
+static void test_tensor_diagnostics() {
+    fixture source;
+    server_memory_collector plain, detailed(2), complete(3);
+    for (auto * collector : {&plain, &detailed, &complete}) {
+        const auto owner = collector->owner(&source, "model", "main");
+        source.inventory(*collector, owner);
+        for (int layer = 0; layer < 3; ++layer) { source.tensor(*collector, owner, 8 * layer, 8, LLAMA_MEMORY_MODEL_PART_REPEATING, layer); }
+    }
+    const auto baseline = plain.finish();
+    GGML_ASSERT(!baseline["weight_storage"].contains("tensor_diagnostics"));
+    auto limited = detailed.finish();
+    const auto diagnostics = limited["weight_storage"]["tensor_diagnostics"];
+    GGML_ASSERT(diagnostics["status"] == "partial" && diagnostics["truncated"] == true);
+    GGML_ASSERT(diagnostics["records"].size() == 2 && diagnostics["record_limit"] == 2);
+    GGML_ASSERT(diagnostics["missing_components"][0]["reason"] == "diagnostic_record_limit");
+    for (const auto & record : diagnostics["records"]) {
+        GGML_ASSERT(record["tensor_name"] == "same-weight-name" && record["size_bytes"] == 8);
+        GGML_ASSERT(record["ranges_complete"] == true && record["ranges"].size() == 1);
+        GGML_ASSERT(record["assignment"]["status"] == "known");
+        GGML_ASSERT(!record.contains("tensor") && !record.contains("data") && !record.contains("address"));
+    }
+    limited["weight_storage"].erase("tensor_diagnostics");
+    GGML_ASSERT(limited == baseline); // truncation never changes the inventory or counted intervals
+    const auto full = complete.finish()["weight_storage"]["tensor_diagnostics"];
+    GGML_ASSERT(full["status"] == "known" && full["truncated"] == false && full["records"].size() == 3);
+}
+
+static void test_diagnostic_names_and_failures() {
+    fixture source;
+    server_memory_collector collector(16);
+    const auto owner = collector.owner(&source, "model", "main");
+    source.inventory(collector, owner);
+    ggml_tensor tensor = {};
+    tensor.name[0] = 'x'; tensor.name[1] = '\\'; tensor.name[2] = '\n'; tensor.name[3] = char(0xff);
+    const llama_memory_tensor_assignment assignment = {&source.device, &source.device, &source.type, LLAMA_MEMORY_ASSIGNMENT_SELECTION};
+    llama_memory_weight_storage_view view = {{LLAMA_MEMORY_MODEL_PART_OUTPUT, -1, &source.buffer, true, assignment, &tensor}, {{0, 8}}, nullptr};
+    collector.weight_storage(owner, view);
+    view.missing_reason = "opaque_tensor_storage";
+    view.ranges.clear();
+    collector.weight_storage(owner, view);
+    const auto report = collector.finish();
+    GGML_ASSERT(!report.dump().empty());
+    const auto records = report["weight_storage"]["tensor_diagnostics"]["records"];
+    GGML_ASSERT(records[0]["tensor_name"] == "x\\\\\\x0a\\xff");
+    GGML_ASSERT(records[1]["size_bytes"].is_null() && records[1]["storage_status"] == "unavailable");
+    GGML_ASSERT(records[1]["storage_reason"] == "opaque_tensor_storage" && records[1]["ranges"].empty());
+    GGML_ASSERT(report["weight_storage"]["tensor_diagnostics"]["status"] == "partial");
+
+    server_memory_weights weights(1);
+    weights.diagnostic_failure();
+    GGML_ASSERT(weights.finish()["status"] == "known");
+    GGML_ASSERT(weights.finish()["tensor_diagnostics"]["status"] == "unavailable");
+    GGML_ASSERT(weights.finish()["tensor_diagnostics"]["missing_components"][0]["reason"] == "diagnostic_collection_failed");
+    bool rejected = false;
+    try { server_memory_weights excessive(server_memory_weights::max_diagnostic_records + 1); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    GGML_ASSERT(rejected);
+}
+
+static void test_diagnostic_range_budget() {
+    server_memory_weights weights(16);
+    const json buffer = {{"id", "b1"}, {"size_bytes", 65536}};
+    const json relationship = {{"owner_id", "o1"}, {"component", "repeating_layers"}, {"layer_index", 0}};
+    const json assignment = {{"status", "known"}, {"device_ids", json::array({"d1"})},
+        {"sources", json::array({"loader_selection"})}, {"reasons", json::array()}};
+    llama_memory_weight_storage_view view = {};
+    view.placement.known = true;
+    for (size_t i = 0; i < 4096; ++i) { view.ranges.push_back({8 * i, 4}); }
+    for (size_t i = 0; i < 5; ++i) {
+        weights.diagnostic(buffer, view, relationship, assignment);
+        weights.tensor(buffer, view, relationship, assignment);
+    }
+    const auto report = weights.finish();
+    GGML_ASSERT(report["status"] == "known" && total(report) == 4096 * 4);
+    const auto diagnostics = report["tensor_diagnostics"];
+    GGML_ASSERT(diagnostics["status"] == "partial" && diagnostics["truncated"] == true);
+    GGML_ASSERT(diagnostics["records"].size() == 5);
+    size_t ranges = 0;
+    for (const auto & record : diagnostics["records"]) { ranges += record["ranges"].size(); }
+    GGML_ASSERT(ranges == server_memory_weights::max_diagnostic_ranges);
+    const auto last = diagnostics["records"][4];
+    GGML_ASSERT(last["ranges_complete"] == false && last["size_bytes"] == 4096 * 4 && last["storage_status"] == "known");
+}
+
 int main() {
     test_sparse_mapping();
     test_shared_roles_and_owners();
@@ -258,5 +342,8 @@ int main() {
     test_invalid_ranges();
     test_copy_and_independent_failure();
     test_random_relationships();
+    test_tensor_diagnostics();
+    test_diagnostic_names_and_failures();
+    test_diagnostic_range_budget();
     std::puts("weight storage report: PASSED");
 }

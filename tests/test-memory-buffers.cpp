@@ -529,6 +529,7 @@ cpu_allocation_fixture * cpu_allocation_fixture::active = nullptr;
 static void test_locality_native_lifecycle() {
     cpu_allocation_fixture fixture;
     server_memory_reporter reporter("fixture-locality");
+    reporter.set_tensor_diagnostics(4096);
     size_t previous_payload = 0;
     for (int generation = 1; generation <= 2; ++generation) {
         fixture.generation = generation;
@@ -571,6 +572,7 @@ static void test_locality_native_lifecycle() {
             reporter.transition("failed", "after_load_failure");
             const auto failed = reporter.read()["weight_storage"];
             GGML_ASSERT(failed["status"] == "unavailable" && failed["intervals"].empty());
+            GGML_ASSERT(failed["tensor_diagnostics"]["status"] == "unavailable" && failed["tensor_diagnostics"]["records"].empty());
         }
         reporter.transition("unloading", "before_unload");
         GGML_ASSERT(reporter.read()["weight_storage"]["intervals"].empty());
@@ -580,7 +582,36 @@ static void test_locality_native_lifecycle() {
         const auto empty = reporter.read()["allocation_locality"];
         GGML_ASSERT(empty["status"] == "known" && empty["allocations"].empty() && empty["bindings"].empty());
         GGML_ASSERT(reporter.read()["weight_storage"]["status"] == "known" && reporter.read()["weight_storage"]["intervals"].empty());
+        GGML_ASSERT(reporter.read()["weight_storage"]["tensor_diagnostics"]["records"].empty());
     }
+}
+
+static void test_native_diagnostic_settings() {
+    auto data = metadata("llama");
+    std::set<ggml_backend_buffer_t> initialized;
+    llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, model_params()));
+    GGML_ASSERT(model);
+    auto ctx = context(model.get());
+    server_memory_reporter reporter("fixture-diagnostic-settings");
+    reporter.capture({ctx.get()}, "after_load");
+    const auto before = reporter.read()["weight_storage"];
+    GGML_ASSERT(!before.contains("tensor_diagnostics"));
+    reporter.set_tensor_diagnostics(2);
+    reporter.capture({ctx.get()}, "after_reconfigure");
+    auto limited = reporter.read()["weight_storage"];
+    GGML_ASSERT(limited["tensor_diagnostics"]["truncated"] == true);
+    limited.erase("tensor_diagnostics");
+    GGML_ASSERT(limited == before);
+    reporter.set_tensor_diagnostics(0);
+    reporter.capture({ctx.get()}, "after_reconfigure");
+    GGML_ASSERT(reporter.read()["weight_storage"] == before);
+    bool rejected = false;
+    try { reporter.set_tensor_diagnostics(server_memory_weights::max_diagnostic_records + 1); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    GGML_ASSERT(rejected);
+    reporter.capture({ctx.get()}, "after_reconfigure");
+    GGML_ASSERT(reporter.read()["weight_storage"] == before);
+    reporter.transition("unloading", "before_unload");
 }
 #endif
 
@@ -928,6 +959,7 @@ int main(int argc, char ** argv) {
 #ifdef TLLAMA_TEST_MEMORY_REPORT
     test_partial_assignment_report();
     test_locality_native_lifecycle();
+    test_native_diagnostic_settings();
 #endif
     {
         auto data = metadata("qwen35");

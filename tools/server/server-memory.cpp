@@ -111,7 +111,7 @@ assignment_evidence resolve_assignment(const llama_memory_placement_view & view,
 
 } // namespace
 
-server_memory_collector::server_memory_collector() {
+server_memory_collector::server_memory_collector(size_t tensor_diagnostics_limit) : weights(tensor_diagnostics_limit) {
     data = {{"status", "known"}, {"missing_components", json::array()},
             {"owners", json::array()}, {"devices", json::array()}, {"buffers", json::array()},
             {"placement", {{"status", "known"}, {"missing_components", json::array()}, {"layer_groups", json::array()}}}};
@@ -265,6 +265,16 @@ void server_memory_collector::weight_storage(size_t owner_index, const llama_mem
     weight_visited.insert(owner_index);
     const auto & placement = view.placement;
     const auto * component = part_name(placement.part);
+    const auto found = buffer_indices.find(placement.buffer);
+    const json relationship = {{"owner_id", data["owners"][owner_index]["id"]}, {"component", component},
+        {"layer_index", placement.layer < 0 ? json() : json(placement.layer)}};
+    json assignment;
+    if (weights.diagnostics_enabled()) {
+        try {
+            assignment = weight_assignment(placement);
+            weights.diagnostic(found == buffer_indices.end() ? json() : data["buffers"][found->second], view, relationship, assignment);
+        } catch (const std::exception &) { weights.diagnostic_failure(); }
+    }
     if (!placement.known) {
         weight_missing(owner_index, component, placement.layer, view.missing_reason ? view.missing_reason : "tensor_unclassified");
         return;
@@ -273,20 +283,21 @@ void server_memory_collector::weight_storage(size_t owner_index, const llama_mem
         weight_missing(owner_index, component, placement.layer, view.missing_reason);
         return;
     }
-    const auto found = buffer_indices.find(placement.buffer);
     if (found == buffer_indices.end()) {
         weight_missing(owner_index, component, placement.layer, "buffer_not_in_inventory");
         return;
     }
-    auto * native = ggml_backend_memory_buffer_device(placement.buffer);
-    const auto evidence = resolve_assignment(placement, native);
-    const json relationship = {{"owner_id", data["owners"][owner_index]["id"]}, {"component", component},
-        {"layer_index", placement.layer < 0 ? json() : json(placement.layer)}};
-    const json assignment = {{"status", evidence.reason ? "unavailable" : "known"},
+    if (assignment.is_null()) { assignment = weight_assignment(placement); }
+    weights.tensor(data["buffers"][found->second], view, relationship, assignment);
+}
+
+json server_memory_collector::weight_assignment(const llama_memory_placement_view & view) {
+    auto * native = view.buffer ? ggml_backend_memory_buffer_device(view.buffer) : nullptr;
+    const auto evidence = resolve_assignment(view, native);
+    return {{"status", evidence.reason ? "unavailable" : "known"},
         {"device_ids", device(evidence.device)},
         {"sources", evidence.source ? json::array({evidence.source}) : json::array()},
         {"reasons", evidence.reason ? json::array({evidence.reason}) : json::array()}};
-    weights.tensor(data["buffers"][found->second], view, relationship, assignment);
 }
 
 json server_memory_collector::finish() const {
@@ -344,10 +355,18 @@ void server_memory_native::reset() {
     cached = {};
 }
 
+void server_memory_native::set_tensor_diagnostics(size_t limit) {
+    if (limit > server_memory_weights::max_diagnostic_records) { throw std::invalid_argument("tensor diagnostic record limit exceeds 4096"); }
+    if (limit != tensor_diagnostics_limit) {
+        reset();
+        tensor_diagnostics_limit = limit;
+    }
+}
+
 json server_memory_native::capture(const server_memory_sources & sources) {
     if (!sources.main) {
         reset();
-        server_memory_collector empty;
+        server_memory_collector empty(tensor_diagnostics_limit);
         empty.missing(no_owner, "inventory", "transition_in_progress");
         empty.missing(no_owner, "inventory", "transition_in_progress", true);
         empty.weight_missing(no_owner, "model_weights", -1, "transition_in_progress");
@@ -355,7 +374,7 @@ json server_memory_native::capture(const server_memory_sources & sources) {
     }
     if (!base || cached.main != sources.main || cached.draft != sources.draft || cached.draft_is_mtp != sources.draft_is_mtp) {
         reset();
-        auto next = std::make_unique<server_memory_collector>();
+        auto next = std::make_unique<server_memory_collector>(tensor_diagnostics_limit);
         std::set<const llama_model *> inspected_models;
         auto add_model = [&](const llama_context * ctx, const char * role) {
             if (!ctx) { return; }

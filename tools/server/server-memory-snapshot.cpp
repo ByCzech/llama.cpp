@@ -11,6 +11,11 @@ void server_memory_reporter::capture(const server_memory_sources & sources, cons
     publish(native.capture(sources), "loaded", stage, force);
 }
 
+void server_memory_reporter::set_tensor_diagnostics(size_t limit) {
+    native.set_tensor_diagnostics(limit);
+    tensor_diagnostics_limit = limit;
+}
+
 void server_memory_reporter::publish(json inventory, const char * model_state, const char * stage, bool force) {
     const auto previous = std::atomic_load_explicit(&current, std::memory_order_acquire);
     if (!force && previous && previous->model_state == model_state && previous->inventory == inventory) {
@@ -25,7 +30,7 @@ void server_memory_reporter::publish(json inventory, const char * model_state, c
 void server_memory_reporter::transition(const char * model_state, const char * stage, bool known_empty, const char * reason) {
     // Invalidate cached buffer identities before any native object can be freed.
     native.reset();
-    server_memory_collector empty;
+    server_memory_collector empty(tensor_diagnostics_limit);
     if (!known_empty) {
         const auto no_owner = std::numeric_limits<size_t>::max();
         empty.missing(no_owner, "inventory", reason);

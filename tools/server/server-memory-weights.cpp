@@ -1,6 +1,7 @@
 #include "server-memory-weights.h"
 
 #include <limits>
+#include <stdexcept>
 #include <map>
 #include <set>
 #include <string>
@@ -23,6 +24,32 @@ struct claim {
     json assignment;
 };
 
+const char * range_error(const json & buffer, const llama_memory_weight_storage_view & storage) {
+    if (storage.missing_reason) { return storage.missing_reason; }
+    if (buffer.is_null()) { return "buffer_not_in_inventory"; }
+    if (buffer["size_bytes"].is_null()) { return "buffer_bounds_unavailable"; }
+    const auto capacity = buffer["size_bytes"].get<uint64_t>();
+    for (const auto range : storage.ranges) {
+        if (range.size == 0 || range.offset > capacity || range.size > capacity - range.offset ||
+                uint64_t(range.size) > std::numeric_limits<uint64_t>::max() - uint64_t(range.offset)) {
+            return "invalid_storage_range";
+        }
+    }
+    return nullptr;
+}
+
+std::string diagnostic_name(const ggml_tensor & tensor) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    for (const unsigned char byte : tensor.name) {
+        if (byte == 0) { break; }
+        if (byte == '\\') { result += "\\\\"; }
+        else if (byte >= 32 && byte < 127) { result += char(byte); }
+        else { result += "\\x"; result += hex[byte >> 4]; result += hex[byte & 15]; }
+    }
+    return result;
+}
+
 } // namespace
 
 struct server_memory_weights::state {
@@ -30,9 +57,18 @@ struct server_memory_weights::state {
     std::map<std::string, json> missing;
     bool usable = false;
     json snapshot;
+    size_t diagnostic_limit = 0;
+    size_t diagnostic_ranges = 0;
+    json diagnostics = json::array();
+    bool records_cut = false, ranges_cut = false, diagnostic_failed = false;
 };
 
-server_memory_weights::server_memory_weights() : data(std::make_shared<state>()) {}
+server_memory_weights::server_memory_weights(size_t diagnostic_limit) : data(std::make_shared<state>()) {
+    if (diagnostic_limit > max_diagnostic_records) { throw std::invalid_argument("tensor diagnostic record limit exceeds 4096"); }
+    data->diagnostic_limit = diagnostic_limit;
+}
+
+bool server_memory_weights::diagnostics_enabled() const { return data->diagnostic_limit != 0; }
 
 server_memory_weights::state & server_memory_weights::write() {
     if (!data.unique()) { data = std::make_shared<state>(*data); }
@@ -46,22 +82,7 @@ void server_memory_weights::missing(const json & relationship, const char * reas
 
 void server_memory_weights::tensor(const json & buffer, const llama_memory_weight_storage_view & storage,
                                    const json & relationship, const json & assignment) {
-    if (storage.missing_reason) {
-        missing(relationship, storage.missing_reason);
-        return;
-    }
-    if (buffer["size_bytes"].is_null()) {
-        missing(relationship, "buffer_bounds_unavailable");
-        return;
-    }
-    const auto capacity = buffer["size_bytes"].get<uint64_t>();
-    for (const auto range : storage.ranges) {
-        if (range.size == 0 || range.offset > capacity || range.size > capacity - range.offset ||
-                uint64_t(range.size) > std::numeric_limits<uint64_t>::max() - uint64_t(range.offset)) {
-            missing(relationship, "invalid_storage_range");
-            return;
-        }
-    }
+    if (const auto * reason = range_error(buffer, storage)) { missing(relationship, reason); return; }
     auto & current = write();
     current.usable = true; // a proved empty tensor is usable evidence too
     if (assignment["status"] != "known") {
@@ -74,6 +95,47 @@ void server_memory_weights::tensor(const json & buffer, const llama_memory_weigh
     for (const auto range : storage.ranges) {
         claims.push_back({uint64_t(range.offset), uint64_t(range.offset) + uint64_t(range.size), relationship, assignment});
     }
+}
+
+void server_memory_weights::diagnostic(const json & buffer, const llama_memory_weight_storage_view & storage,
+                                      const json & relationship, const json & assignment) {
+    if (!diagnostics_enabled()) { return; }
+    auto & current = write();
+    if (current.diagnostics.size() == current.diagnostic_limit) { current.records_cut = true; return; }
+    const auto * reason = range_error(buffer, storage);
+    uint64_t size = 0;
+    if (!reason) {
+        for (const auto range : storage.ranges) {
+            if (uint64_t(range.size) > std::numeric_limits<uint64_t>::max() - size) { reason = "invalid_storage_range"; break; }
+            size += uint64_t(range.size);
+        }
+    }
+    json ranges = json::array();
+    bool ranges_complete = reason == nullptr;
+    if (!reason) {
+        for (const auto range : storage.ranges) {
+            if (current.diagnostic_ranges == max_diagnostic_ranges) {
+                current.ranges_cut = true;
+                ranges_complete = false;
+                break;
+            }
+            ranges.push_back({{"offset_bytes", uint64_t(range.offset)}, {"size_bytes", uint64_t(range.size)}});
+            ++current.diagnostic_ranges;
+        }
+    }
+    const auto * tensor = storage.placement.tensor;
+    current.diagnostics.push_back({{"id", "t" + std::to_string(current.diagnostics.size() + 1)},
+        {"tensor_name", tensor ? json(diagnostic_name(*tensor)) : json()},
+        {"owner_id", relationship["owner_id"]},
+        {"component", storage.placement.known ? relationship["component"] : json()},
+        {"layer_index", relationship["layer_index"]}, {"buffer_id", buffer.is_null() ? json() : buffer["id"]},
+        {"storage_status", reason ? "unavailable" : "known"}, {"storage_reason", reason ? json(reason) : json()},
+        {"size_bytes", reason ? json() : json(size)}, {"ranges_complete", ranges_complete},
+        {"ranges", ranges}, {"assignment", assignment}});
+}
+
+void server_memory_weights::diagnostic_failure() {
+    if (diagnostics_enabled()) { write().diagnostic_failed = true; }
 }
 
 const json & server_memory_weights::finish() const {
@@ -140,5 +202,17 @@ const json & server_memory_weights::finish() const {
     data->snapshot = {{"scope", "model_weights"}, {"deduplication", "buffer_ranges"},
         {"status", missing.empty() ? "known" : data->usable ? "partial" : "unavailable"},
         {"missing_components", failures}, {"intervals", intervals}};
+    if (diagnostics_enabled()) {
+        const json global = {{"owner_id", json()}, {"component", "model_weights"}, {"layer_index", json()}};
+        if (data->records_cut) { add_missing(missing, global, "diagnostic_record_limit"); }
+        if (data->ranges_cut) { add_missing(missing, global, "diagnostic_range_limit"); }
+        if (data->diagnostic_failed) { add_missing(missing, global, "diagnostic_collection_failed"); }
+        json diagnostic_missing = json::array();
+        for (const auto & entry : missing) { diagnostic_missing.push_back(entry.second); }
+        data->snapshot["tensor_diagnostics"] = {{"status", missing.empty() ? "known" : data->diagnostics.empty() ? "unavailable" : "partial"},
+            {"record_limit", uint64_t(data->diagnostic_limit)}, {"range_limit", uint64_t(max_diagnostic_ranges)},
+            {"truncated", data->records_cut || data->ranges_cut}, {"name_encoding", "byte_escape"},
+            {"missing_components", diagnostic_missing}, {"records", data->diagnostics}};
+    }
     return data->snapshot;
 }

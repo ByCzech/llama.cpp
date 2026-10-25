@@ -26,7 +26,7 @@ struct server_memory_sources {
 // Owner-thread collector. No live native pointer is stored in its JSON result.
 class server_memory_collector {
 public:
-    server_memory_collector();
+    explicit server_memory_collector(size_t tensor_diagnostics_limit = 0);
     size_t owner(const void * identity, const char * kind, const char * role);
     void buffer(size_t owner_index, const llama_memory_buffer_view & view);
     void placement(size_t owner_index, const llama_memory_placement_view & view);
@@ -58,6 +58,7 @@ private:
     std::vector<std::set<llama_memory_backing>> backings;
     std::map<std::tuple<size_t, llama_memory_model_part, int32_t>, layer> layers;
     json device(ggml_backend_dev_t native);
+    json weight_assignment(const llama_memory_placement_view & view);
 };
 
 // Cache only static model metadata. reset() must precede destruction or replacement of native owners.
@@ -65,8 +66,10 @@ class server_memory_native {
 public:
     json capture(const server_memory_sources & sources);
     void reset();
+    void set_tensor_diagnostics(size_t limit);
 
 private:
     server_memory_sources cached;
     std::unique_ptr<server_memory_collector> base;
+    size_t tensor_diagnostics_limit = 0;
 };

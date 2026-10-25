@@ -9,6 +9,7 @@
 class server_memory_reporter {
 public:
     explicit server_memory_reporter(std::string fingerprint = {});
+    void set_tensor_diagnostics(size_t limit);
     void capture(const server_memory_sources & sources, const char * stage, bool force = true);
     void publish(json inventory, const char * model_state, const char * stage, bool force = true);
     void transition(const char * model_state, const char * stage, bool known_empty = false,
@@ -26,5 +27,6 @@ private:
     const std::string fingerprint;
     server_memory_native native;
     uint64_t sequence = 0;
+    size_t tensor_diagnostics_limit = 0;
     std::shared_ptr<const snapshot> current;
 };

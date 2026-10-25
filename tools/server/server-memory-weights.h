@@ -9,7 +9,13 @@
 // Copies share immutable captured data until a write; finish() caches the interval sweep.
 class server_memory_weights {
 public:
-    server_memory_weights();
+    static constexpr size_t max_diagnostic_records = 4096;
+    static constexpr size_t max_diagnostic_ranges = 16384;
+    explicit server_memory_weights(size_t diagnostic_limit = 0);
+    bool diagnostics_enabled() const;
+    void diagnostic(const common_json & buffer, const llama_memory_weight_storage_view & storage,
+                    const common_json & relationship, const common_json & assignment);
+    void diagnostic_failure();
     void tensor(const common_json & buffer, const llama_memory_weight_storage_view & storage,
                 const common_json & relationship, const common_json & assignment);
     void missing(const common_json & relationship, const char * reason);

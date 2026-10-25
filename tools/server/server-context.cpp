@@ -1210,6 +1210,7 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        memory_reporter.set_tensor_diagnostics(params.memory_tensor_diagnostics);
         memory_reporter.transition("loading", "before_load");
         try {
             if (load_model_impl(params)) {

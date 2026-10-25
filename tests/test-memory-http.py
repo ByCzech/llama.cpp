@@ -155,7 +155,8 @@ def validate(report):
 
     if "weight_storage" in report:
         weights = report["weight_storage"]
-        assert set(weights) == {"scope", "deduplication", "status", "missing_components", "intervals"}
+        required_weights = {"scope", "deduplication", "status", "missing_components", "intervals"}
+        assert required_weights <= set(weights) <= required_weights | {"tensor_diagnostics"}
         assert weights["scope"] == "model_weights" and weights["deduplication"] == "buffer_ranges"
         assert weights["status"] in ("known", "partial", "unavailable")
         assert (weights["status"] == "known") == (not weights["missing_components"])
@@ -203,6 +204,48 @@ def validate(report):
             assert key not in failures
             failures.add(key)
         assert weights["status"] != "unavailable" or not weights["intervals"]
+        if "tensor_diagnostics" in weights:
+            diagnostics = weights["tensor_diagnostics"]
+            assert set(diagnostics) == {"status", "record_limit", "range_limit", "truncated", "name_encoding", "missing_components", "records"}
+            assert diagnostics["status"] in ("known", "partial", "unavailable")
+            assert type(diagnostics["record_limit"]) is int and 1 <= diagnostics["record_limit"] <= 4096
+            assert diagnostics["range_limit"] == 16384 and type(diagnostics["truncated"]) is bool
+            assert diagnostics["name_encoding"] == "byte_escape"
+            assert (diagnostics["status"] == "known") == (not diagnostics["missing_components"])
+            assert not diagnostics["truncated"] or diagnostics["status"] == "partial"
+            assert len(diagnostics["records"]) <= diagnostics["record_limit"]
+            record_ids, range_count = set(), 0
+            for record in diagnostics["records"]:
+                assert set(record) == {"id", "tensor_name", "owner_id", "component", "layer_index", "buffer_id",
+                                       "storage_status", "storage_reason", "size_bytes", "ranges_complete", "ranges", "assignment"}
+                assert record["id"] not in record_ids
+                record_ids.add(record["id"])
+                assert record["owner_id"] in models
+                assert record["component"] is None or record["component"] in components
+                assert record["buffer_id"] is None or record["buffer_id"] in buffers
+                name = record["tensor_name"]
+                assert name is None or (isinstance(name, str) and len(name) <= 512 and all(32 <= ord(c) < 127 for c in name))
+                assert record["storage_status"] in ("known", "unavailable")
+                assert type(record["ranges_complete"]) is bool
+                assert set(record["assignment"]["device_ids"]) <= devices
+                if record["storage_status"] == "unavailable":
+                    assert record["size_bytes"] is None and record["storage_reason"]
+                    assert record["ranges"] == [] and not record["ranges_complete"]
+                else:
+                    assert type(record["size_bytes"]) is int and record["size_bytes"] >= 0
+                    assert record["storage_reason"] is None
+                length, end = 0, 0
+                for item in record["ranges"]:
+                    assert set(item) == {"offset_bytes", "size_bytes"}
+                    offset, size = item["offset_bytes"], item["size_bytes"]
+                    assert type(offset) is int and type(size) is int and offset >= end and size > 0
+                    end = offset + size
+                    assert record["buffer_id"] in buffers and end <= descriptions[record["buffer_id"]]["size_bytes"]
+                    length += size
+                    range_count += 1
+                if record["ranges_complete"]:
+                    assert length == record["size_bytes"]
+            assert range_count <= diagnostics["range_limit"]
 
 
 def test_loaded_auth_and_stream(server, model, directory, mmap):
@@ -218,6 +261,7 @@ def test_loaded_auth_and_stream(server, model, directory, mmap):
         assert initial["placement"]["status"] == "known", initial["placement"]
         assert initial["weight_storage"]["status"] == "known", initial["weight_storage"]
         assert initial["weight_storage"]["intervals"]
+        assert "tensor_diagnostics" not in initial["weight_storage"]
         cpu_devices = {item["id"] for item in initial["devices"] if item["type"] == "cpu"}
         for group in initial["placement"]["layer_groups"]:
             assert group["assignment"]["status"] == "known"
@@ -286,6 +330,30 @@ def test_sleep(server, model, directory):
         print("sleep/read-without-wake/reload PASSED")
 
 
+def test_tensor_diagnostics(server, model, directory):
+    baseline = None
+    for limit in (2, 4096):
+        with worker(server, model, directory, "--memory-tensor-diagnostics", str(limit), "--sleep-idle-seconds", "1") as instance:
+            assert instance.request("/tllama/memory", key=None)[0] == 401
+            initial = instance.report()
+            weights = initial["weight_storage"]
+            diagnostics = weights.pop("tensor_diagnostics")
+            assert weights["status"] == "known" and diagnostics["records"]
+            if baseline is None:
+                baseline = weights
+            else:
+                assert weights == baseline
+            assert diagnostics["truncated"] == (limit == 2)
+            assert diagnostics["status"] == ("partial" if limit == 2 else "known")
+            saved = instance.wait(lambda: (value if (value := instance.report())["model_state"] == "sleeping" else None))
+            empty = saved["weight_storage"]["tensor_diagnostics"]
+            assert empty["status"] == "known" and not empty["records"] and not empty["truncated"]
+            assert instance.request("/completion", data={"prompt": [1, 2, 3], "n_predict": 1})[0] == 200
+            after = instance.report()
+            assert after["weight_storage"]["tensor_diagnostics"] == diagnostics
+    print("optional bounded tensor diagnostics/sleep/reload PASSED")
+
+
 def test_router(server, directory):
     models = directory / "empty-models"
     models.mkdir()
@@ -306,6 +374,7 @@ def main():
         test_loaded_auth_and_stream(args.server, model, directory, mmap=True)
         test_loaded_auth_and_stream(args.server, model, directory, mmap=False)
         test_sleep(args.server, model, directory)
+        test_tensor_diagnostics(args.server, model, directory)
         test_router(args.server, directory)
 
 
