@@ -1173,6 +1173,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
 struct ggml_cuda_device_info {
     int device_count;           // number of (possibly virtual) devices exposed to the rest of ggml
     int physical_device_count;  // number of physical CUDA devices actually present
+    bool host_api_pinning_proven; // All visible devices permit proving the host API page-locking contract
 
     struct cuda_device_info {
         int     cc;                             // compute capability
@@ -1180,6 +1181,7 @@ struct ggml_cuda_device_info {
         size_t  smpb;                           // max. shared memory per block
         size_t  smpbo;                          // max. shared memory per block (with opt-in)
         bool    integrated;                     // Device is integrated as opposed to discrete
+        bool    allocation_integrated;          // Actual SDK property; independent of optimization policy
         bool    vmm;                            // virtual memory support
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;

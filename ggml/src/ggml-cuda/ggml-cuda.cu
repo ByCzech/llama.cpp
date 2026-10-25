@@ -5,6 +5,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/ggml-cuda-memory.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -184,34 +185,43 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
-    ggml_cuda_set_device(device);
-    cudaError_t err;
-    if (ggml_cuda_unified_memory_enabled()) {
-        err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
-        if (err == hipSuccess) {
-            // hipMemAdviseSetCoarseGrain is an optional performance hint;
-            // ignore errors (e.g. hipErrorInvalidValue on some APU/iGPU configs).
+static constexpr auto ggml_cuda_native_memory_api = ggml_cuda_memory_api::hip;
+#else
+static constexpr auto ggml_cuda_native_memory_api = ggml_cuda_memory_api::cuda;
+#endif
+
+static cudaError_t ggml_cuda_device_malloc(
+        void ** ptr, size_t size, int device, ggml_cuda_memory_record * metadata = nullptr) {
+    ggml_cuda_set_device(device);
+    ggml_cuda_memory_record temporary;
+    return ggml_cuda_memory_allocate(metadata ? *metadata : temporary, ggml_cuda_native_memory_api,
+        size, ggml_cuda_unified_memory_enabled(),
+        [&] { return cudaMalloc(ptr, size); },
+        [&] { return cudaMallocManaged(ptr, size); },
+        [](cudaError_t err) { return err == cudaSuccess; },
+        [&] {
+#if defined(GGML_USE_HIP)
+            // Keep the existing optional hint and error clearing, outside inspection.
             (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
-            (void)hipGetLastError(); // clear any error
-        }
-
-        // fall back to cudaMalloc if not supported (e.g. on Windows)
-        if (err == hipErrorNotSupported) {
-            static bool warned_unsupported = false;
-            if (!warned_unsupported) {
-                GGML_LOG_WARN("hipMallocManaged unsupported, falling back to hipMalloc.\n");
-                warned_unsupported = true;
+            (void)hipGetLastError();
+#endif
+        },
+        [](cudaError_t err) {
+#if defined(GGML_USE_HIP)
+            if (err == hipErrorNotSupported) {
+                static bool warned_unsupported = false;
+                if (!warned_unsupported) {
+                    GGML_LOG_WARN("hipMallocManaged unsupported, falling back to hipMalloc.\n");
+                    warned_unsupported = true;
+                }
+                return true;
             }
-
-            err = cudaMalloc(ptr, size);
-        }
-#endif // defined(GGML_USE_HIP)
-    } else {
-        err = cudaMalloc(ptr, size);
-    }
-    return err;
+#else
+            GGML_UNUSED(err);
+#endif
+            return false;
+        });
 }
 
 #if defined(GGML_USE_HIP)
@@ -305,9 +315,15 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
 
     int64_t total_vram = 0;
+    info.host_api_pinning_proven = info.physical_device_count > 0;
     for (int id = 0; id < info.physical_device_count; ++id) {
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // cudaMallocHost need not page-lock on systems using host page tables.
+        // The host API does not name a device: require evidence for every visible device.
+        info.host_api_pinning_proven &= prop.pageableMemoryAccessUsesHostPageTables == 0;
+#endif
         total_vram += prop.totalGlobalMem;
     }
     GGML_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices (Total VRAM: %zu MiB):\n",
@@ -351,6 +367,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
+        info.devices[id].allocation_integrated = prop.integrated != 0;
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
@@ -787,6 +804,7 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    ggml_cuda_memory_record memory;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -794,6 +812,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        memory = {};
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -947,7 +966,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    ggml_cuda_memory_record memory;
+    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device, &memory);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -956,6 +976,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    memory.device = ggml_backend_buft_get_device(buft);
+    memory.integrated_known = true;
+    memory.integrated = ggml_cuda_info().devices[buft_ctx->device].allocation_integrated;
+    ctx->memory = memory;
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -1332,7 +1356,15 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+static ggml_cuda_memory_host_records & ggml_cuda_host_memory_records() {
+    static ggml_cuda_memory_host_records records;
+    return records;
+}
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if !defined(GGML_USE_MUSA)
+    ggml_cuda_host_memory_records().forget(buffer);
+#endif
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1365,6 +1397,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+#if !defined(GGML_USE_MUSA)
+    auto memory = ggml_cuda_memory_candidate(ggml_cuda_native_memory_api,
+        ggml_cuda_info().host_api_pinning_proven ? GGML_BACKEND_MEMORY_ALLOCATION_KIND_HOST_PINNED :
+            GGML_BACKEND_MEMORY_ALLOCATION_KIND_HOST, size);
+    memory.known = true;
+    ggml_cuda_host_memory_records().remember(buffer, memory);
+#endif
 
     return buffer;
 }
@@ -6207,10 +6246,48 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 }
 
 static uint32_t ggml_backend_cuda_memory_buffer_flags(ggml_backend_buffer_t buffer) {
-    return buffer->iface.free_buffer == ggml_backend_cuda_host_buffer_free_buffer ? GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED : 0;
+    if (buffer->iface.free_buffer != ggml_backend_cuda_host_buffer_free_buffer) {
+        return 0;
+    }
+#if !defined(GGML_USE_MUSA)
+    const auto memory = ggml_cuda_host_memory_records().find(buffer);
+    return memory && memory->kind == GGML_BACKEND_MEMORY_ALLOCATION_KIND_HOST_PINNED ?
+        GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED : 0;
+#else
+    return GGML_BACKEND_MEMORY_BUFFER_HOST_PINNED;
+#endif
 }
 
+#if !defined(GGML_USE_MUSA)
+static ggml_backend_memory_allocation_status ggml_backend_cuda_memory_allocations(
+        ggml_backend_buffer_t buffer, ggml_backend_memory_allocation_callback callback, void * user_data) {
+    const auto size = ggml_backend_buffer_get_size(buffer);
+    if (size == 0 && !buffer->context) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE;
+    }
+    if (buffer->iface.free_buffer == ggml_backend_cuda_host_buffer_free_buffer) {
+        auto & records = ggml_cuda_host_memory_records();
+        const auto memory = records.find(buffer);
+        return memory ? ggml_cuda_memory_visit(*memory, &records, memory.get(), size, callback, user_data) :
+            GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    if (buffer->iface.free_buffer != ggml_backend_cuda_buffer_free_buffer) {
+        return GGML_BACKEND_MEMORY_ALLOCATION_UNSUPPORTED;
+    }
+    const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(buffer->context);
+    if (!ctx || !ctx->dev_ptr) {
+        return size == 0 ? GGML_BACKEND_MEMORY_ALLOCATION_COMPLETE : GGML_BACKEND_MEMORY_ALLOCATION_UNAVAILABLE;
+    }
+    return ggml_cuda_memory_visit(ctx->memory, ctx->memory.device, ctx, size, callback, user_data);
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if !defined(GGML_USE_MUSA)
+    if (strcmp(name, "tllama_buffer_memory_allocations_v1") == 0) {
+        return (void *) ggml_backend_cuda_memory_allocations;
+    }
+#endif
     if (strcmp(name, "tllama_buffer_memory_flags") == 0) {
         return (void *) ggml_backend_cuda_memory_buffer_flags;
     }

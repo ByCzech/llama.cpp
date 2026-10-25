@@ -95,6 +95,8 @@ ignored. Missing values are not zero. V1 attribute conventions are:
 | `vulkan.heap_index` | Heap selected by that memory type on that device. |
 | `vulkan.memory_property_flags` | Raw property flags of that selected type. |
 | `vulkan.heap_flags` | Raw flags of the selected heap. |
+| `cuda.device_integrated` | Saved cudaDeviceProp::integrated, normalized to 0/1, for the proved allocation device. |
+| `hip.device_integrated` | Saved hipDeviceProp_t::integrated, normalized to 0/1, for the proved allocation device. |
 | `level_zero.memory_ordinal` | Ordinal accepted by the direct Level Zero allocation path. |
 
 Vulkan `DEVICE_LOCAL` and `HOST_VISIBLE` bits are independent. Preserve raw flags
@@ -146,18 +148,93 @@ known zero, overflow rejection before callback and callback exceptions.
 ## Exporter coverage work list
 
 Keep source implementation, SDK compilation and hardware tests separate. The
-following records the scope at the shared-helper step, not a hardware support
-matrix. No additional exporter is enabled by this step.
+following records source coverage after the initial CUDA/HIP exporter step,
+not a hardware support matrix. SDK-free tests do not qualify GPU execution.
 
 | Backend / path | Source status | Remaining qualification |
 | --- | --- | --- |
 | Vulkan ordinary, pinned host and successful host imports | Existing exporter, now using shared attempt/range helpers | Preserve SDK-free regression; native allocation/import/inference tests remain separate. |
-| CUDA ordinary device and managed allocations | Planned L1 | Attach successful-path metadata; compile CUDA 12.4/12.9/13.3; test applicable paths on P100 and available modern GPU. |
-| HIP ordinary device and managed fallback | Planned L2, shared source with CUDA | Record hipMallocManaged versus successful hipMalloc fallback; compile ROCm 10.1; qualify gfx906 and gfx90c UMA. |
-| CUDA/HIP pinned host and registered host views | Planned L1/L2 | Preserve CPU fallback; prove registration-to-buffer bindings and association instead of guessing from the provider. |
+| CUDA ordinary device and managed allocations | Exported; shared helper and native host glue tested with fake SDK | Compile CUDA 12.4/12.9/13.3; test applicable paths on P100 and available modern GPU. |
+| HIP ordinary device and managed fallback | Exported; actual successful path retained, shared source with CUDA | Compile ROCm 10.1; qualify gfx906 and gfx90c UMA. |
+| CUDA/HIP host allocations | Exported; CPU context/fallback preserved; known/unproven pinning distinguished | Native host allocation/free, multi-device and low-memory qualification. |
+| CUDA/HIP registered host views and raw CPU aliases | Not exported in this step | Prove registration-to-CPU-buffer bindings and lifecycle before enabling this path. |
 | CUDA/HIP split, VMM and pools | Audit required in L1/L2 | Prove shard/range mapping or expose explicit incomplete coverage; reserved virtual space and idle/internal pools are not automatically backend-buffer allocations. |
 | SYCL device/host/shared/system USM and async paths | Planned L3 | Capture actual USM/context metadata, host fallback and free/reuse; compile oneAPI and test available Intel GPU. |
 | CPU/system allocation exporter | No new exporter in this step | Preserve existing unsupported/unknown behavior. |
+
+## CUDA/HIP exporter
+
+The common CUDA/HIP translation unit exports the existing v1 procedure for
+ordinary backend-owned device buffers, successful managed allocations and
+host allocation buffers. It records the successful API only. HIP's existing
+hipMallocManaged-not-supported fallback records hipMalloc as DEVICE; a failed
+attempt/fallback publishes no successful metadata. Advice and error clearing
+remain in allocation paths, never inspection. MUSA does not advertise this
+exporter.
+
+Device records live in their owning buffer contexts. Their identity domain is
+the associated registry device and their identity is the owned allocation
+context, not the numeric CUDA/HIP pointer. The actual SDK integrated property
+is saved during existing discovery separately from the integrated optimization
+flag, which is deliberately disabled elsewhere. This does not enable that
+optimization. DEVICE allocations on a proved non-integrated device are
+DEVICE_LOCAL in the API sense; integrated or unknown devices and MANAGED
+allocations keep UNKNOWN locality. Neither result measures page residency or
+proves dedicated physical VRAM. The device association is the device selected
+for allocation, not a statement that other devices cannot access the memory.
+
+Host allocation records use a separate registry keyed by the live buffer.
+The CPU buffer's raw-pointer context and get/clear/copy operations remain intact.
+Only metadata is retained; free erases the record before freeing native memory.
+Inspection obtains an immutable retained metadata record and releases its lock
+before the callback. Its domain is this backend's host record registry and its
+identity is the live record. No GPU0 association is inferred from the host
+buffer type's provider device. Failed metadata storage produces unavailable
+coverage while preserving the successful native allocation.
+
+CUDA documents that cudaMallocHost may not page-lock on systems where
+pageableMemoryAccessUsesHostPageTables is true. Because this host API names no
+device, discovery proves pinning only if every visible physical CUDA device
+reports that property false; otherwise the allocation is conservatively HOST,
+with native_api=cudaMallocHost. HIP's documented host allocation path is
+HOST_PINNED. The existing HOST_PINNED buffer flag now follows the saved proof,
+including absent metadata, rather than the destructor/name alone. Failed or
+disabled pinned attempts return the actual CPU buffer with no failed CUDA/HIP
+metadata. No extra discovery query is added: existing physical-device queries
+supply the cached evidence, and inspection never reads SDK state.
+
+The reported span is the logical range accepted by the native allocation API.
+It is not allocator rounding, driver reserved capacity, RSS or a physical byte
+sum. A buffer binding covers its proved part of that span. Known empty probes
+without a native allocation emit no allocation. Missing or invalid metadata
+returns UNAVAILABLE; unrelated private contexts return UNSUPPORTED.
+
+This step does not export cudaHostRegister/hipHostRegister ranges attached to
+CPU_Mapped buffers or arbitrary CPU aliases over a host allocation. Backend
+meta/split objects remain unsupported without proved shard bindings; generic
+multi-buffers still require leaf traversal. VMM reservations, idle/internal
+pools, graph and cuBLAS workspaces are not separately exported as backend-buffer
+allocations. They must not be added to this scope by guessing from addresses.
+Existing per-buffer device allocations used by model/KV/compute allocators
+remain covered when represented by the supported native buffer type.
+
+`test-memory-cuda` tests the production metadata/control-flow helpers, native
+API naming, managed fallback, integrated/unknown locality, host record lifetime
+and concurrent access for distinct owners. `test-memory-cuda-native.py` extracts
+the actual host allocation, discovery-policy, free and inspection functions
+from ggml-cuda.cu and compiles them against a fake SDK on Linux. It checks CPU
+buffer behavior and fallback, free hooks, pinning proof, managed fallback,
+empty probes and missing metadata. Counters establish that inspection performs
+no native call, device selection, SDK property query, environment read or log.
+Its MUSA variant checks only that this exporter is not advertised. It does not
+compile GPU kernels or establish actual CUDA/HIP SDK/runtime compatibility.
+
+Primary API references:
+
+- [CUDA 12.4.1 memory API](https://docs.nvidia.com/cuda/archive/12.4.1/cuda-runtime-api/group__CUDART__MEMORY.html)
+- [CUDA 13.3.0 device properties](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-runtime-api/structcudaDeviceProp.html)
+- [HIP memory management](https://rocmdocs.amd.com/projects/HIP/en/latest/how-to/hip_runtime_api/memory_management.html)
+- [HIP integrated property](https://rocm.docs.amd.com/projects/HIP/en/docs-7.0.0/doxygen/html/structhip_device_prop__t.html)
 
 ## Vulkan exporter
 
