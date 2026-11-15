@@ -430,9 +430,9 @@ json server_memory_native::capture(const server_memory_sources & sources) {
     add_context(sources.draft, sources.draft_is_mtp ? "mtp" : "draft");
     if (sources.projector) {
         try {
-            if (!mtmd_visit_projectors(sources.projector, [&](const clip_ctx * projector, mtmd_memory_role role) {
+            if (!mtmd_visit_projectors(sources.projector, [&](const mtmd_subcontext * projector, mtmd_memory_role role) {
                 const auto owner = current.owner(projector, "projector", role == MTMD_MEMORY_ROLE_VISION ? "vision" : role == MTMD_MEMORY_ROLE_AUDIO ? "audio" : "audio_generation");
-                if (!clip_visit_buffers(projector, [&](const llama_memory_buffer_view & view) { current.buffer(owner, view); })) {
+                if (!mtmd_projector_visit_buffers(projector, [&](const llama_memory_buffer_view & view) { current.buffer(owner, view); })) {
                     current.missing(owner, "projector_weights", "collector_not_implemented");
                     current.missing(owner, "projector_compute", "collector_not_implemented");
                 } else { current.known_source(); }

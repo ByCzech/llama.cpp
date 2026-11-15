@@ -79,7 +79,11 @@ Each buffer has exactly these fields:
 Components include `model_weights`, `kv_cache`, `recurrent_state`, `state_other`,
 `compute`, `output`, `moe_cache`, `control_vector`, `adapter_weights`,
 `projector_weights`, and `projector_compute`. Saved on-device context states are
-included as `state_other`. A legitimately absent component, such as KV cache in
+included as `state_other`, together with persistent device buffers for layer-input
+and NextN state export. KV rotation buffers are included as `kv_cache`. Shared
+mtmd scheduler buffers have a `projector_compute` relationship to each borrowing
+projector, while their capacity contributes only once to inventory totals.
+A legitimately absent component, such as KV cache in
 an embeddings-only context, does not make coverage partial.
 
 Generic multi-buffers are flattened and shared leaves counted once. Backend
@@ -247,7 +251,9 @@ The HTTP test uses Python's standard library and a generated CPU GGUF model; it
 downloads no model. It tests authentication, schema, mmap/allocated backing,
 reads during an unbounded stream, request snapshots, sleep/reload, and router
 exclusion. Native tests separately compare sizes with live buffer APIs and cover
-shared weights, output growth, hybrid state, LoRA, missing and opaque buffers.
+shared weights, output growth, hybrid state, LoRA, missing and opaque buffers,
+layer-input export allocation/free, and real mtmd subcontexts sharing a CPU
+scheduler without double-counting compute memory.
 A CPU-backed test provider exercises the real loader's host assignment, partial
 offload, overrides, fallback, mmap and tied-weight paths through JSON collection;
 a 40-layer fixture checks the 0-20 CPU / 21-39 GPU boundary and GPU output.

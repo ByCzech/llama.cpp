@@ -21,9 +21,12 @@ PREFIX = r'''
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#define GGML_SYCL_MAX_DEVICES 2
 #define GGML_SYCL_NAME "fixture"
 #define GGML_SYCL_DEBUG(...) ((void)0)
 #define SYCL_BUFFER_ALIGNMENT 128
@@ -99,16 +102,25 @@ struct fixture_device {
 struct dev_mgr {
     fixture_device devices[2];
     static dev_mgr & instance() { static dev_mgr manager; return manager; }
+    int get_device_id(const sycl::device &) { return 0; }
     fixture_device & get_device(int id) { ++calls.device; return devices[id]; }
 };
 }
 static int g_ggml_sycl_use_level_zero_api = 1;
 static bool g_ggml_sycl_usm_system = false, g_ggml_sycl_enable_host_pinned_mem = true;
 struct optimize_feature {};
+enum class gpu_arch { other, intel_gpu_bmg_g21, intel_gpu_bmg_g31 };
 struct fixture_info {
-    struct { bool usm_system_support = true, l0_device_type_valid = true, l0_discrete_gpu = true; optimize_feature opt_feature; } devices[2];
+    struct { struct { gpu_arch arch = gpu_arch::other; } hw_info; bool usm_system_support = true, l0_device_type_valid = true, l0_discrete_gpu = true; optimize_feature opt_feature; } devices[2];
 } info;
 static const fixture_info & ggml_sycl_info() { ++calls.info; return info; }
+static int g_ggml_sycl_bmg_vram_check = 1;
+static size_t fixture_free = 1024, fixture_total = 1024;
+static bool sycl_get_mem_info(int, size_t * free, size_t * total) {
+    ++calls.info; *free = fixture_free; *total = fixture_total; return true;
+}
+static bool ggml_sycl_memtrace_enabled() { return false; }
+static void ggml_sycl_memtrace_report_device(const char *, int, size_t, size_t) { ++calls.trace; }
 static void ggml_check_sycl() { ++calls.check; }
 static void ggml_sycl_set_device(int) { ++calls.select; }
 static void check_allow_gpu_index(int i) { GGML_ASSERT(i >= 0 && i < 2); }
@@ -189,6 +201,19 @@ int main() {
         ggml_backend_buffer_free(buffer);
         q->context_id = 1;
     }
+    // The new BMG capacity gate must reject without allocating or leaving stale metadata.
+    info.devices[0].hw_info.arch = gpu_arch::intel_gpu_bmg_g21;
+    ggml_sycl_memory_record capacity_record;
+    void * capacity_ptr = ggml_sycl_malloc_device(512, *q, GGML_SYCL_MEM_BUFFER, &capacity_record);
+    GGML_ASSERT(capacity_ptr && capacity_record.known && g_ggml_sycl_dev_alloc_bytes[0] == 512);
+    ggml_sycl_memory_record rejected = capacity_record;
+    const int before_reject = calls.allocations;
+    GGML_ASSERT(!ggml_sycl_malloc_device(768, *q, GGML_SYCL_MEM_BUFFER, &rejected));
+    GGML_ASSERT(!rejected.known && calls.allocations == before_reject);
+    ggml_sycl_free_device(capacity_ptr, *q, &capacity_record);
+    GGML_ASSERT(g_ggml_sycl_dev_alloc_bytes[0] == 0 && g_ggml_sycl_dev_allocs.empty());
+    GGML_ASSERT(g_ggml_sycl_dev_free_baseline[0] == 0);
+    info.devices[0].hw_info.arch = gpu_arch::other;
     fail_device = true;
     GGML_ASSERT(!ggml_backend_buft_alloc_buffer(&buft, 512));
     fail_device = false;
@@ -268,7 +293,7 @@ def main():
         start = text.index(begin)
         return text[start:text.index(end, start)]
     use_l0 = part(common, "#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API\nstatic bool ggml_sycl_use_level_zero_device_alloc", "// Use Level Zero zeMemAllocDevice")
-    malloc_free = part(common, "void * ggml_sycl_malloc_device", "void release_extra_gpu")
+    malloc_free = part(common, "static void * ggml_sycl_malloc_device_impl", "void release_extra_gpu")
     device = part(source, "struct ggml_backend_sycl_buffer_context {", "static enum ggml_status\nggml_backend_sycl_buffer_init_tensor")
     iface = r'''
 static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = [] {

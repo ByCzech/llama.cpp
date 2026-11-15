@@ -3,6 +3,8 @@
 #include "../ggml/src/ggml-cuda/ggml-cuda-memory.h"
 #include "../ggml/src/ggml-sycl/ggml-sycl-memory.hpp"
 #include "ggml-cpu.h"
+#include "../tools/mtmd/mtmd-memory.h"
+#include "../tools/mtmd/mtmd-subcontext.h"
 
 #include <cstring>
 #include <cstdio>
@@ -487,9 +489,63 @@ static void test_locality_failures() {
     GGML_ASSERT(empty.finish()["allocation_locality"]["status"] == "unavailable");
 }
 
+// Real mtmd subcontexts and scheduler, using tiny CPU weight/compute allocations.
+// No model inference is simulated by this fixture.
+static void test_projector_shared_scheduler() {
+    mtmd_backends backends(nullptr, 1, 128, nullptr, nullptr);
+    mtmd_model first, second;
+    auto init_model = [](mtmd_model & model) {
+        model.max_nodes = 128;
+        model.hparams.patch_size = 1;
+        model.hparams.warmup_image_size = 1;
+        model.hparams.n_embd = 4;
+        model.hparams.n_head = model.hparams.n_head_kv = 1;
+        model.ctx_data.reset(ggml_init({4 * ggml_tensor_overhead(), nullptr, true}));
+        model.mm_2_w = ggml_new_tensor_2d(model.ctx_data.get(), GGML_TYPE_F32, 4, 4);
+        model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), ggml_backend_cpu_buffer_type()));
+        GGML_ASSERT(model.buf);
+    };
+    init_model(first);
+    init_model(second);
+    const mtmd_subctx_params params = { MTMD_FLASH_ATTN_TYPE_DISABLED, false };
+    mtmd_subcontext a(first, backends, params), b(second, backends, params);
+    ggml_context_ptr graph_ctx(ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(128, false), nullptr, true}));
+    auto * input = ggml_new_tensor_1d(graph_ctx.get(), GGML_TYPE_F32, 1024);
+    auto * output = ggml_scale(graph_ctx.get(), input, 2.0f);
+    ggml_set_input(input);
+    ggml_set_output(output);
+    auto * graph = ggml_new_graph_custom(graph_ctx.get(), 128, false);
+    ggml_build_forward_expand(graph, output);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(backends.sched.get(), graph));
+    const size_t compute = ggml_backend_sched_get_buffer_size(backends.sched.get(), backends.backend_cpu);
+    GGML_ASSERT(compute > 0);
+    server_memory_collector collector;
+    for (auto * ctx : { &a, &b }) {
+        const auto owner = collector.owner(ctx, "projector", ctx == &a ? "vision" : "audio");
+        GGML_ASSERT(mtmd_projector_visit_buffers(ctx, [&](const llama_memory_buffer_view & view) { collector.buffer(owner, view); }));
+        collector.known_source();
+    }
+    const auto report = collector.finish();
+    GGML_ASSERT(report["owners"].size() == 2);
+    GGML_ASSERT(total(report) == compute + ggml_backend_buffer_get_size(first.buf.get()) + ggml_backend_buffer_get_size(second.buf.get()));
+    size_t shared_compute = 0;
+    for (const auto & buffer : report["buffers"]) {
+        if (buffer["owners"].size() == 2) {
+            shared_compute += buffer["size_bytes"].get<size_t>();
+            for (const auto & owner : buffer["owners"]) {
+                GGML_ASSERT(owner["component"] == "projector_compute");
+            }
+        }
+    }
+    GGML_ASSERT(shared_compute == compute);
+    GGML_ASSERT(!mtmd_projector_visit_buffers(nullptr, [](const llama_memory_buffer_view &) {}));
+    ggml_backend_sched_reset(backends.sched.get());
+}
+
 int main() {
     ggml_backend_load_all();
     test_deduplication();
+    test_projector_shared_scheduler();
     test_device_classification();
     test_assignment_evidence();
     test_partial_and_unknown();

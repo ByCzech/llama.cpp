@@ -879,6 +879,17 @@ static void test_model(const std::string & arch, const char * model_path) {
         const auto after_decode = inspect(ctx.get());
         GGML_ASSERT(bytes(after_decode, LLAMA_MEMORY_COMPONENT_OUTPUT) > bytes(initial, LLAMA_MEMORY_COMPONENT_OUTPUT));
         check_native_sizes(ctx.get(), weights, after_decode);
+        // DFlash layer-input export has its own persistent buffer outside the scheduler.
+        GGML_ASSERT(bytes(inspect(ctx.get()), LLAMA_MEMORY_COMPONENT_STATE_OTHER) == 0);
+        llama_set_embeddings_layer_inp(ctx.get(), 0, true);
+        llama_set_embeddings_layer_inp_dev(ctx.get(), true);
+        GGML_ASSERT(bytes(inspect(ctx.get()), LLAMA_MEMORY_COMPONENT_STATE_OTHER) > 0);
+#ifdef TLLAMA_TEST_MEMORY_REPORT
+        check_report(collector, {ctx.get()});
+#endif
+        llama_set_embeddings_layer_inp_dev(ctx.get(), false);
+        llama_set_embeddings_layer_inp(ctx.get(), 0, false);
+        GGML_ASSERT(bytes(inspect(ctx.get()), LLAMA_MEMORY_COMPONENT_STATE_OTHER) == 0);
         const auto flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
         const auto state_size = llama_state_seq_get_size_ext(ctx.get(), 0, flags);
         GGML_ASSERT(state_size > 0);

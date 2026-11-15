@@ -9,6 +9,10 @@
 
 #include "server-common.h"
 
+#include <cpp-httplib/httplib.h>
+
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <random>
 #include <sstream>
@@ -16,7 +20,9 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <atomic>
 #include <chrono>
+#include <iostream>
 #include <thread>
 
 #ifdef _WIN32
@@ -199,6 +205,19 @@ const char * get_media_marker() {
 }
 
 //
+// audio utils
+//
+
+std::string pcm_f32_to_s16(const float * samples, size_t n) {
+    std::string bytes(n * sizeof(int16_t), '\0');
+    for (size_t i = 0; i < n; i++) {
+        const int16_t v = (int16_t) std::lround(std::max(-1.0f, std::min(1.0f, samples[i])) * 32767.0f);
+        memcpy(&bytes[2 * i], &v, sizeof(v));
+    }
+    return bytes;
+}
+
+//
 // model output modalities
 //
 
@@ -217,6 +236,9 @@ std::vector<std::string> server_model_output_modalities(common_decision_type dec
         case COMMON_DECISION_TYPE_LFM2_D1:
         case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
         case COMMON_DECISION_TYPE_H2O_LIGHTNING:
+        case COMMON_DECISION_TYPE_MINICPM_OCR_JEV:
+        case COMMON_DECISION_TYPE_LFM3_D1:
+        case COMMON_DECISION_TYPE_LFM3_D1_OMNI:
             out = {"decisions"};
             break;
         case COMMON_DECISION_TYPE_GRANITE_SWITCH:
@@ -1195,10 +1217,55 @@ json oaicompat_completion_params_parse(const json & body) {
 // - file:// for local files (only allowed if media_path is set)
 // - data: for base64 encoded data with uri scheme (e.g. data:image/png;base64,...)
 // - raw base64 encoded data
+static bool ipv4_is_public(const unsigned char * b) {
+    return !(b[0] == 0 || b[0] == 10 || b[0] == 127 || b[0] >= 224 // this network, private, loopback, multicast, reserved
+        || (b[0] == 100 && (b[1] & 0xc0) == 64)                    // 100.64.0.0/10 CGNAT
+        || (b[0] == 169 && b[1] == 254)                            // link-local, cloud metadata
+        || (b[0] == 172 && (b[1] & 0xf0) == 16)                    // 172.16.0.0/12
+        || (b[0] == 192 && b[1] == 168)                            // 192.168.0.0/16
+        || (b[0] == 192 && b[1] == 0 && b[2] == 0)                 // 192.0.0.0/24
+        || (b[0] == 198 && (b[1] & 0xfe) == 18));                  // 198.18.0.0/15
+}
+
+bool server_addr_is_public(const std::string & addr) {
+    unsigned char b[16];
+    if (inet_pton(AF_INET, addr.c_str(), b) == 1) {
+        return ipv4_is_public(b);
+    }
+    if (inet_pton(AF_INET6, addr.c_str(), b) != 1) {
+        return false; // e.g. scoped address "fe80::1%eth0"
+    }
+    static const unsigned char v4_mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    static const unsigned char nat64[12]     = {0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0};
+    static const unsigned char zero[12]      = {};
+    if (memcmp(b, v4_mapped, 12) == 0 || memcmp(b, nat64, 12) == 0) {
+        return ipv4_is_public(b + 12);
+    }
+    return memcmp(b, zero, 12) != 0                 // ::/96: unspecified, loopback, IPv4-compatible
+        && (b[0] & 0xfe) != 0xfc                    // fc00::/7 unique local
+        && !(b[0] == 0xfe && (b[1] & 0x80) == 0x80) // fe80::/10 link-local, fec0::/10 site-local
+        && b[0] != 0xff;                            // multicast
+}
+
+std::string server_resolve_public_addr(const std::string & host, bool allow_private) {
+    std::vector<std::string> addrs;
+    httplib::hosted_at(host, addrs);
+    if (addrs.empty()) {
+        throw std::invalid_argument("cannot resolve host: " + host);
+    }
+    for (const auto & addr : addrs) {
+        if (!allow_private && !server_addr_is_public(addr)) {
+            throw std::invalid_argument("host is not a public address: " + host);
+        }
+    }
+    return addrs[0];
+}
+
 void handle_media(
         std::vector<raw_buffer> & out_files,
         const std::string & url,
-        const std::string & media_path) {
+        const std::string & media_path,
+        bool allow_private_urls) {
     if (!media_path.empty()) {
         // should already be enforced by arg.cpp, but checking just in case
         GGML_ASSERT(media_path.back() == DIRECTORY_SEPARATOR);
@@ -1210,6 +1277,9 @@ void handle_media(
         common_remote_params params;
         params.max_size = 1024 * 1024 * 10; // 10MB
         params.timeout  = 10; // seconds
+        params.resolve_host = [allow_private_urls](const std::string & host) {
+            return server_resolve_public_addr(host, allow_private_urls);
+        };
         SRV_INF("downloading image from '%s'\n", url.c_str());
         auto res = common_remote_get_content(url, params);
         if (200 <= res.first && res.first < 300) {
@@ -1276,7 +1346,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
 
             json image_url = json_value(p, "image_url", json::object());
             std::string url = json_value(image_url, "url", std::string());
-            handle_media(out_files, url, opt.media_path);
+            handle_media(out_files, url, opt.media_path, opt.media_allow_private_urls);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1291,7 +1361,7 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json input_audio = json_value(p, "input_audio", json::object());
             std::string url  = json_value(input_audio, "data",
                                     json_value(input_audio, "url", std::string()));
-            handle_media(out_files, url, opt.media_path);
+            handle_media(out_files, url, opt.media_path, opt.media_allow_private_urls);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
@@ -1306,14 +1376,14 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
             json input_video = json_value(p, type, json::object());
             std::string url  = json_value(input_video, "data",
                                     json_value(input_video, "url", std::string()));
-            handle_media(out_files, url, opt.media_path);
+            handle_media(out_files, url, opt.media_path, opt.media_allow_private_urls);
 
             p["type"] = "media_marker";
             p["text"] = get_media_marker();
             p.erase("input_video");
             p.erase("video_url");
 
-        } else if (type != "text") {
+        } else if (type != "text" && type != "tool_reference") {
             throw std::invalid_argument("unsupported content[].type");
         }
     }
@@ -1385,10 +1455,14 @@ json oaicompat_chat_params_parse(
                 json_schema = json_value(response_format, "schema", json::object());
             }
         } else if (response_type == "json_schema") {
-            auto schema_wrapper = json_value(response_format, "json_schema", json::object());
-            json_schema = json_value(schema_wrapper, "schema", json::object());
+            if (response_format.contains("json_schema")) {
+                auto schema_wrapper = json_value(response_format, "json_schema", json::object());
+                json_schema = json_value(schema_wrapper, "schema", json::object());
+            } else {
+                json_schema = json_value(response_format, "schema", json::object());
+            }
         } else if (!response_type.empty() && response_type != "text") {
-            throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
+            throw std::invalid_argument("response_format type must be one of \"text\", \"json_object\" or \"json_schema\", but got: " + response_type);
         }
     }
 
@@ -1439,7 +1513,7 @@ json oaicompat_chat_params_parse(
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
     inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
     inputs.continue_final_message = body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :
@@ -2209,4 +2283,65 @@ void server_subproc::waiter::wait(const std::vector<server_subproc *> & procs, s
         }
     }
 #endif
+}
+
+//
+// server_role
+//
+
+server_role::server_role() {
+    if (is_managed_by_router()) {
+        cmd_out = server_reserve_stdout();
+    }
+}
+
+server_role::~server_role() {
+    if (cmd_out) {
+        fclose(cmd_out);
+    }
+}
+
+bool server_role::is_managed_by_router() {
+    return std::getenv(SERVER_ENV_ROUTER_PORT) != nullptr;
+}
+
+server_role_type server_role::get_role() {
+    const char * role = std::getenv(SERVER_ENV_CHILD_ROLE);
+    return server_role_type_from_str(role ? role : "");
+}
+
+std::thread server_role::setup(const std::function<void(int)> & shutdown_handler) {
+    // setup thread for monitoring stdin
+    return std::thread([shutdown_handler]() {
+        // wait for EOF on stdin
+        SRV_INF("%s", "child server monitoring thread started, waiting for EOF on stdin...\n");
+        bool eof = false;
+        while (true) {
+            std::string line;
+            if (!std::getline(std::cin, line)) {
+                // EOF detected, that means the router server is unexpectedly exit or killed
+                eof = true;
+                break;
+            }
+            if (line.find(CMD_ROUTER_TO_CHILD_EXIT) != std::string::npos) {
+                SRV_INF("%s", "exit command received, exiting...\n");
+                shutdown_handler(0);
+                break;
+            }
+        }
+        if (eof) {
+            SRV_INF("%s", "EOF on stdin detected, forcing shutdown...\n");
+            exit(1);
+        }
+    });
+}
+
+void server_role::notify_to_router(const std::string & state, const json & payload) {
+    json data = {
+        {"state", state},
+        {"payload", payload},
+    };
+    std::lock_guard<std::mutex> lk(mtx_stdout);
+    fprintf(cmd_out, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    fflush(cmd_out);
 }
