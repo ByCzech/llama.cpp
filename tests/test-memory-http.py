@@ -330,6 +330,33 @@ def test_sleep(server, model, directory):
         print("sleep/read-without-wake/reload PASSED")
 
 
+def test_stream_connection_reuse(server, model, directory):
+    with worker(server, model, directory) as instance:
+        connection = http.client.HTTPConnection("127.0.0.1", instance.port, timeout=5)
+        try:
+            connection.connect()
+            connection.auto_open = 0
+            original_socket = connection.sock
+            headers = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
+            for _ in range(2):
+                connection.request("POST", "/completion", json.dumps({
+                    "prompt": [1, 2, 3], "n_predict": 4, "stream": True,
+                    "ignore_eos": True, "cache_prompt": False}), headers)
+                with connection.getresponse() as response:
+                    assert response.status == 200 and response.chunked and not response.will_close
+                    events = [json.loads(line[6:]) for line in response.read().splitlines()
+                              if line.startswith(b"data: ")]
+                    assert events and events[-1]["stop"] is True
+                connection.request("GET", "/tllama/memory", headers=headers)
+                with connection.getresponse() as response:
+                    assert response.status == 200
+                    validate(json.loads(response.read()))
+                assert connection.sock is original_socket
+        finally:
+            connection.close()
+        print("stream/Memory API/stream on one HTTP connection PASSED")
+
+
 def test_tensor_diagnostics(server, model, directory):
     baseline = None
     for limit in (2, 4096):
@@ -373,6 +400,7 @@ def main():
         subprocess.run([args.fixture_generator, "--write-model", str(model)], check=True, timeout=15)
         test_loaded_auth_and_stream(args.server, model, directory, mmap=True)
         test_loaded_auth_and_stream(args.server, model, directory, mmap=False)
+        test_stream_connection_reuse(args.server, model, directory)
         test_sleep(args.server, model, directory)
         test_tensor_diagnostics(args.server, model, directory)
         test_router(args.server, directory)

@@ -15,6 +15,7 @@
 #endif
 
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <set>
@@ -485,6 +486,47 @@ static llama_context_ptr context(llama_model * model, bool embeddings = false) {
     llama_context_ptr ctx(llama_init_from_model(model, params));
     GGML_ASSERT(ctx);
     return ctx;
+}
+
+static void test_recurrent_nan_reset() {
+    auto data = metadata("qwen35");
+    std::set<ggml_backend_buffer_t> initialized;
+    llama_model_ptr model(llama_model_init_from_user(data.get(), initialize_tensor, &initialized, model_params()));
+    GGML_ASSERT(model);
+    auto ctx = context(model.get());
+    auto batch = llama_batch_init(8, 0, 1);
+    batch.n_tokens = 8;
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        batch.token[i] = 1;
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    llama_synchronize(ctx.get());
+    const size_t n_logits = batch.n_tokens * llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const auto * logits = llama_get_logits(ctx.get());
+    const std::vector<float> reference(logits, logits + n_logits);
+    const auto tensors = llama_memory_get_tensors(llama_get_memory(ctx.get()));
+    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    size_t poisoned = 0;
+    for (auto * tensor : tensors) {
+        const std::string name = tensor->name;
+        if (name.find("cache_s_l") == 0 || name.find("cache_r_l") == 0) {
+            ggml_backend_tensor_memset(tensor, 0xff, 0, ggml_nbytes(tensor));
+            ++poisoned;
+        }
+    }
+    GGML_ASSERT(poisoned > 0);
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    logits = llama_get_logits(ctx.get());
+    for (size_t i = 0; i < n_logits; ++i) {
+        GGML_ASSERT(std::isfinite(reference[i]) && std::isfinite(logits[i]));
+        GGML_ASSERT(std::fabs(reference[i] - logits[i]) < 1e-5f);
+    }
+    llama_batch_free(batch);
+    std::puts("recurrent state: NaN reset and request isolation PASSED");
 }
 
 #ifdef TLLAMA_TEST_MEMORY_REPORT
@@ -966,6 +1008,7 @@ int main(int argc, char ** argv) {
     for (const auto & arch : {"llama", "qwen35", "bert"}) {
         test_model(arch, argv[1]);
     }
+    test_recurrent_nan_reset();
     test_missing_placement();
 #ifdef TLLAMA_TEST_MEMORY_REPORT
     test_partial_assignment_report();
