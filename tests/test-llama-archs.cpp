@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "../src/models/models.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -326,6 +327,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
     } else if (arch == LLM_ARCH_HRM_TEXT) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
+    } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+        n_embd  = 128;
+        n_head  = 4;
+        n_ff    = 24;
+        n_layer = arch == LLM_ARCH_INKLING2_LOOP ? 6 : 3;
     }
 
     uint32_t n_head_kv = n_head;
@@ -691,6 +697,54 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_MUDD_TAP_INDICES,            std::vector<int32_t>({-1, -1, -1, -1, 0, 2, 1, 3}));
     }
 
+    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+        const bool loop = arch == LLM_ARCH_INKLING2_LOOP;
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,   uint32_t(4));
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,   uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,           0.25f);
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,     0.1f);
+        ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,   uint32_t(4));
+        ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,   0.1f);
+        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2));
+        if (loop) {
+            // two-layer prelude, core and coda; three passes add four cache slots
+            ms.add_kv(LLM_KV_LOOP_START,     uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_END,       uint32_t(4));
+            ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(3));
+            ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
+            ms.add_kv(LLM_KV_LOOP_VARYING,   false);
+
+            // Include expert scales so later loop passes must share the completed layers.
+            ggml_init_params params = { ggml_tensor_overhead()*3*n_layer, nullptr, true };
+            ggml_context_ptr ctx(ggml_init(params));
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                auto * gate_up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 2*n_ff, 4);
+                ggml_format_name(gate_up, "blk.%u.ffn_gate_up_exps.weight", il);
+                gguf_add_tensor(ret.get(), gate_up);
+                for (const char * name : { "ffn_gate_up_exps", "ffn_down_exps" }) {
+                    auto * scale = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 4);
+                    ggml_format_name(scale, "blk.%u.%s.scale", il, name);
+                    gguf_add_tensor(ret.get(), scale);
+                }
+            }
+        }
+        ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
+        ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
+        ms.add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,         n_vocab);
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        0.2f);
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 0.3f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        8.0f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     30.0f);
+        ms.add_kv(LLM_KV_EXPERT_COUNT,                uint32_t(4));
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,           uint32_t(2));
+        std::vector<bool> pattern(n_layer);
+        for (uint32_t i = 0; i < n_layer; ++i) {
+            pattern[i] = i % 2 == 0;
+        }
+        std::vector<uint8_t> values(pattern.begin(), pattern.end());
+        gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(), GGUF_TYPE_BOOL, values.data(), values.size());
+    }
+
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
     {
         std::vector<std::string> tokenizer_list(n_vocab);
@@ -784,7 +838,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
-    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
+    // the inkling2_loop core boundaries must be multiples of the block size
+    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP ? 2 : 12));
     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
@@ -834,6 +889,19 @@ static llama_model_ptr get_model(
         llama_model_load_from_file_ptr(file, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
+    }
+    if (model->arch == LLM_ARCH_INKLING2_LOOP) {
+        const auto & loop = static_cast<const llama_model_inkling2_loop &>(*model);
+        for (int il = loop.n_phys; il < (int) loop.hparams.n_layer(); ++il) {
+            const auto & physical = loop.layers[loop.layer_phys(il)];
+            const auto & slot = loop.layers[il];
+            if (!physical.ffn_up_exps_s || !physical.ffn_down_exps_s ||
+                slot.ffn_up_exps_s != physical.ffn_up_exps_s ||
+                slot.ffn_down_exps_s != physical.ffn_down_exps_s ||
+                slot.ffn_gate_up_exps != physical.ffn_gate_up_exps) {
+                throw std::runtime_error("inkling2_loop: cache slot lost physical expert weights or scales");
+            }
+        }
     }
     return model;
 }
@@ -1047,6 +1115,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_KOLIBRI1:
         case LLM_ARCH_METIS16:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
